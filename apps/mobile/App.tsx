@@ -1,3 +1,21 @@
+// Initialize Sentry as early as possible — must run before any other imports
+// that might throw, so crashes during startup are still captured.
+// `enabled` guards on (a) DSN being set and (b) not running in dev, so shipping
+// without a configured DSN is a no-op.
+//
+// TODO(release): wire EAS Build + sentry-cli source-map upload before App
+// Store release. Without source maps, native/JS stack traces in Sentry will
+// reference minified bundle positions. See:
+// https://docs.sentry.io/platforms/react-native/sourcemaps/uploading/expo/
+import * as Sentry from '@sentry/react-native';
+
+Sentry.init({
+  dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+  enabled: !!process.env.EXPO_PUBLIC_SENTRY_DSN && !__DEV__,
+  tracesSampleRate: 0.1,
+  enableNative: true,
+});
+
 import { useEffect, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import * as Font from 'expo-font';
@@ -63,7 +81,7 @@ function PushRegistrationGate() {
   return null;
 }
 
-export default function App() {
+function App() {
   const colorScheme = useColorScheme();
   const theme = colorScheme === 'dark' ? customDarkTheme : customLightTheme;
   const [fontsReady, setFontsReady] = useState(false);
@@ -102,3 +120,5 @@ export default function App() {
     </GestureHandlerRootView>
   );
 }
+
+export default Sentry.wrap(App);

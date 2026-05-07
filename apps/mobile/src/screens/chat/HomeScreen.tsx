@@ -34,6 +34,7 @@ import {
 } from '../../services/aiChat';
 
 import { fetchAlerts } from '../../store/alertsSlice';
+import { fetchOne as fetchApprovalOne, setFocus as setApprovalFocus } from '../../store/approvalsSlice';
 import { ChatHeader } from './components/ChatHeader';
 import { ColdOpenChips } from './components/ColdOpenChips';
 import { Composer } from './components/Composer';
@@ -123,8 +124,18 @@ export function HomeScreen() {
             case 'message_end':
               break;
             case 'approval_required':
-              // ApprovalGate (phase 1) handles the takeover via push. The
-              // chat surface stays calm; nothing to do here in step 1.
+              // When approvalRequestId is present (server linked the AI tool execution
+              // to an approval_requests row), surface the takeover immediately by
+              // focusing the approvals slice. ApprovalGate watches focusId and renders
+              // ApprovalScreen on top of everything. The parallel push notification
+              // path also resolves here, harmlessly — both call setFocus/fetchOne
+              // idempotently.
+              if (ev.approvalRequestId) {
+                dispatch(setApprovalFocus(ev.approvalRequestId));
+                dispatch(fetchApprovalOne(ev.approvalRequestId));
+              }
+              // Older server (no approvalRequestId): no-op fallback. The 5-min
+              // server-side waitForApproval timeout will eventually resolve.
               break;
             case 'error':
               dispatch(failAssistantMessage({ id: assistantId, error: ev.message }));

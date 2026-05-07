@@ -109,6 +109,9 @@ const USER_ID_SCOPED_TABLES: ReadonlySet<string> = new Set<string>([
   // approval_requests: MCP step-up approval records, scoped to the requesting
   // user via breeze_current_user_id(). Shape 6 policy.
   'approval_requests',
+  // account_deletion_requests: user-initiated deletion queue records, scoped
+  // to the requesting user via breeze_current_user_id(). Shape 6 policy.
+  'account_deletion_requests',
 ]);
 
 const REQUIRED_CMDS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;

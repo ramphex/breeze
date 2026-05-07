@@ -10,7 +10,7 @@
  */
 
 import { db, withDbAccessContext } from '../db';
-import { aiSessions, aiMessages, aiToolExecutions, aiActionPlans, devices, deviceSessions } from '../db/schema';
+import { aiSessions, aiMessages, aiToolExecutions, aiActionPlans, devices, deviceSessions, approvalRequests } from '../db/schema';
 import { eq, and, isNull } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiPageContext, AiApprovalMode } from '@breeze/shared/types/ai';
@@ -22,6 +22,7 @@ import { TOOL_TIERS, type PreToolUseCallback, type PostToolUseCallback } from '.
 import { writeAuditEvent, requestLikeFromSnapshot, type RequestLike } from './auditEvents';
 import type { ActiveSession, AuditSnapshot } from './streamingSessionManager';
 import { compactToolResultForChat } from './aiToolOutput';
+import { buildApprovalPush, getUserPushTokens, sendExpoPush } from './expoPush';
 
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -369,13 +370,97 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
         }
       }
 
+      // Bridge to mobile-readable approval_requests row.
+      // Mobile clients read from /api/v1/mobile/approvals/* (NEVER from
+      // ai_tool_executions). The approve/deny route handlers resolve the
+      // execution_id back to the SDK's waitForApproval() poll.
+      //
+      // Tier → riskTier mapping (documented in the spec):
+      //   Tier 2 → 'medium' (auto-approve still mutates; per_step shows mobile)
+      //   Tier 3 → 'high'   (destructive — execute_command, run_script, …)
+      //   Tier 4 → 'critical' (blocked at guardrail layer; never reaches here)
+      // We don't have a separate "destructive" tier today, so Tier 3 is the
+      // ceiling that actually fires. Pick 'high' as the safe default for
+      // anything unexpected.
+      const description = guardrailCheck.description ?? `Execute ${toolName}`;
+      const riskTier: 'medium' | 'high' | 'critical' =
+        guardrailCheck.tier >= 4 ? 'critical' : guardrailCheck.tier >= 3 ? 'high' : 'medium';
+      const actionLabel = description;
+      const riskSummary = description.length > 500 ? `${description.slice(0, 497)}...` : description;
+      const expiresAt = new Date(Date.now() + 300_000); // matches waitForApproval timeout
+
+      let approvalRequestId: string | undefined;
+      try {
+        const [approvalRow] = await withDbAccessContext(
+          {
+            scope: 'organization',
+            orgId: session.orgId,
+            accessibleOrgIds: [session.orgId],
+            userId: session.auth.user.id,
+          },
+          () =>
+            db
+              .insert(approvalRequests)
+              .values({
+                userId: session.auth.user.id,
+                executionId: approvalExec!.id,
+                requestingClientLabel: 'Breeze AI',
+                requestingMachineLabel: null,
+                actionLabel,
+                actionToolName: stripMcpPrefix(toolName),
+                actionArguments: input as Record<string, unknown>,
+                riskTier,
+                riskSummary,
+                status: 'pending',
+                expiresAt,
+              })
+              .returning({ id: approvalRequests.id })
+        );
+        approvalRequestId = approvalRow?.id;
+      } catch (err) {
+        console.error('[AI-SDK] Failed to create mobile approval_request row:', err);
+        // Non-fatal: SSE approval flow still works for in-app web UI even
+        // without the mobile-readable row. The approve/deny handler simply
+        // won't have an executionId to resolve back to.
+      }
+
+      // Best-effort push notification to the user's mobile device(s).
+      if (approvalRequestId) {
+        try {
+          const tokens = await withDbAccessContext(
+            {
+              scope: 'organization',
+              orgId: session.orgId,
+              accessibleOrgIds: [session.orgId],
+              userId: session.auth.user.id,
+            },
+            () => getUserPushTokens(session.auth.user.id),
+          );
+          if (tokens.length > 0) {
+            await sendExpoPush(
+              tokens.map((to) => ({
+                to,
+                ...buildApprovalPush({
+                  approvalId: approvalRequestId!,
+                  actionLabel,
+                  requestingClientLabel: 'Breeze AI',
+                }),
+              })),
+            );
+          }
+        } catch (err) {
+          console.error('[AI-SDK] Failed to dispatch approval push notification:', err);
+        }
+      }
+
       // Emit approval_required event via session event bus → UI shows Approve/Reject
       session.eventBus.publish({
         type: 'approval_required',
         executionId: approvalExec.id,
+        approvalRequestId,
         toolName,
         input,
-        description: guardrailCheck.description ?? `Execute ${toolName}`,
+        description,
         deviceContext,
       });
 

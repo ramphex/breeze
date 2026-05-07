@@ -6,6 +6,7 @@ import { phoneRoutes } from './phone';
 import { passwordRoutes } from './password';
 import { inviteRoutes } from './invite';
 import { verifyEmailRoutes } from './verifyEmail';
+import { accountDeletionRoutes } from './accountDeletion';
 
 export const authRoutes = new Hono();
 
@@ -19,4 +20,5 @@ authRoutes.route('/', phoneRoutes);
 authRoutes.route('/', passwordRoutes);
 authRoutes.route('/', inviteRoutes);
 authRoutes.route('/', verifyEmailRoutes);
+authRoutes.route('/', accountDeletionRoutes);
 

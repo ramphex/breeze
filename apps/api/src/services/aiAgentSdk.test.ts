@@ -26,6 +26,7 @@ vi.mock('../db/schema', () => ({
   aiActionPlans: {},
   devices: {},
   deviceSessions: {},
+  approvalRequests: { id: 'id' },
 }));
 
 vi.mock('drizzle-orm', () => ({
@@ -73,6 +74,23 @@ vi.mock('./auditEvents', () => ({
 vi.mock('./aiAgentSdkTools', () => ({
   TOOL_TIERS: { query_devices: 1, take_screenshot: 2, execute_command: 3 },
   BREEZE_MCP_TOOL_NAMES: [],
+}));
+
+const mockGetUserPushTokens = vi.fn();
+const mockSendExpoPush = vi.fn();
+const mockBuildApprovalPush = vi.fn((..._args: unknown[]) => ({
+  title: 'Approval requested',
+  body: 'Breeze AI: Execute command',
+  data: { type: 'approval', approvalId: 'x' },
+  sound: 'default' as const,
+  priority: 'high' as const,
+  channelId: 'approvals',
+  ttl: 60,
+}));
+vi.mock('./expoPush', () => ({
+  getUserPushTokens: (...args: unknown[]) => mockGetUserPushTokens(...args),
+  sendExpoPush: (...args: unknown[]) => mockSendExpoPush(...args),
+  buildApprovalPush: (...args: unknown[]) => mockBuildApprovalPush(...args),
 }));
 
 // ============================================
@@ -443,6 +461,8 @@ describe('createSessionPreToolUse', () => {
     vi.clearAllMocks();
     vi.mocked(checkToolPermission).mockResolvedValue(null);
     vi.mocked(checkToolRateLimit).mockResolvedValue(null);
+    mockGetUserPushTokens.mockResolvedValue([]);
+    mockSendExpoPush.mockResolvedValue([]);
   });
 
   it('auto-approve allows Tier 2 tools and creates an executing audit record', async () => {
@@ -474,6 +494,7 @@ describe('createSessionPreToolUse', () => {
       description: 'Execute command',
     } as any);
     const { values } = mockInsertReturning({ id: 'exec-1' });
+    mockGetUserPushTokens.mockResolvedValue([]);
     vi.mocked(waitForApproval).mockResolvedValue(false);
     const session = makeActiveSession({ approvalMode: 'auto_approve' });
 
@@ -491,6 +512,73 @@ describe('createSessionPreToolUse', () => {
       toolName: 'execute_command',
     }));
     expect(waitForApproval).toHaveBeenCalledWith('exec-1', 300_000, expect.any(AbortSignal));
+  });
+
+  it('inserts a linked approval_requests row and emits approvalRequestId on per-step approval', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true,
+      tier: 3,
+      requiresApproval: true,
+      description: 'Execute command on host-1',
+    } as any);
+    const { values } = mockInsertReturning({ id: 'exec-1' });
+    mockGetUserPushTokens.mockResolvedValue(['ExponentPushToken[abc]']);
+    mockSendExpoPush.mockResolvedValue([{ status: 'ok' }]);
+    vi.mocked(waitForApproval).mockResolvedValue(true);
+    const session = makeActiveSession({ approvalMode: 'per_step' });
+
+    const result = await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(result).toEqual({ allowed: true });
+
+    // Both inserts fire: ai_tool_executions THEN approval_requests.
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      toolName: 'execute_command',
+      status: 'pending',
+    }));
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-1',
+      executionId: 'exec-1',
+      requestingClientLabel: 'Breeze AI',
+      actionToolName: 'execute_command',
+      riskTier: 'high',
+      status: 'pending',
+    }));
+
+    // Push dispatched (best-effort).
+    expect(mockGetUserPushTokens).toHaveBeenCalledWith('user-1');
+    expect(mockSendExpoPush).toHaveBeenCalled();
+
+    // SSE event includes BOTH executionId and approvalRequestId.
+    expect(session.eventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'approval_required',
+      executionId: 'exec-1',
+      approvalRequestId: 'exec-1',
+      toolName: 'execute_command',
+      description: 'Execute command on host-1',
+    }));
+  });
+
+  it('maps tier 2 → medium and tier 3 → high in approval_requests', async () => {
+    // Tier 2 in per_step mode also requires approval.
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true,
+      tier: 2,
+      requiresApproval: false,
+      description: 'Take screenshot',
+    } as any);
+    const { values } = mockInsertReturning({ id: 'exec-2' });
+    mockGetUserPushTokens.mockResolvedValue([]);
+    vi.mocked(waitForApproval).mockResolvedValue(true);
+    const session = makeActiveSession({ approvalMode: 'per_step' });
+
+    await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      executionId: 'exec-2',
+      riskTier: 'medium',
+    }));
   });
 
   it('blocks tools outside the session allowlist before approval handling', async () => {

@@ -102,7 +102,7 @@ export type AiStreamEvent =
   | { type: 'tool_use_start'; toolUseId: string; toolName: string; input?: unknown }
   | { type: 'tool_result'; toolUseId: string; output?: unknown; isError?: boolean }
   | { type: 'message_end'; messageId?: string }
-  | { type: 'approval_required'; executionId: string; toolName: string; description?: string }
+  | { type: 'approval_required'; executionId: string; toolName: string; description?: string; approvalRequestId?: string }
   | { type: 'error'; message: string }
   | { type: 'done' }
   | { type: 'unknown'; raw: { event: string; data: unknown } };

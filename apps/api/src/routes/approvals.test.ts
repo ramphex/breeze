@@ -23,6 +23,10 @@ vi.mock('../db/schema/approvals', () => ({
   approvalRequests: {},
 }));
 
+vi.mock('../db/schema/ai', () => ({
+  aiToolExecutions: { id: 'id' },
+}));
+
 const TEST_USER = {
   id: '00000000-0000-0000-0000-000000000001',
   email: 't@example.com',
@@ -237,6 +241,27 @@ describe('POST /approvals/:id/approve', () => {
     const res = await buildApp().request('/approvals/missing/approve', { method: 'POST' });
     expect(res.status).toBe(404);
   });
+
+  it('mirrors approval to ai_tool_executions when executionId is linked', async () => {
+    const linkedRow = { ...updatedRow, executionId: 'exec-42' };
+    // First update (approval_requests) returns the row; second update
+    // (ai_tool_executions) just resolves.
+    const aiSet = vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
+    const approvalReturning = vi.fn().mockResolvedValue([linkedRow]);
+    const approvalSet = vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({ returning: approvalReturning }),
+    });
+    vi.mocked(db.update)
+      .mockReturnValueOnce({ set: approvalSet } as any)
+      .mockReturnValueOnce({ set: aiSet } as any);
+
+    const res = await buildApp().request('/approvals/a1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(approvalSet).toHaveBeenCalled();
+    expect(aiSet).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'approved', approvedBy: TEST_USER.id }),
+    );
+  });
 });
 
 describe('POST /approvals/:id/deny', () => {
@@ -292,6 +317,46 @@ describe('POST /approvals/:id/deny', () => {
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.finalStatus).toBe('approved');
+  });
+
+  it('mirrors deny to ai_tool_executions as rejected when executionId is linked', async () => {
+    const deniedRow = {
+      id: 'a1',
+      userId: TEST_USER.id,
+      requestingClientLabel: 'Breeze AI',
+      requestingMachineLabel: null,
+      requestingClientId: null,
+      requestingSessionId: null,
+      actionLabel: 'x',
+      actionToolName: 'execute_command',
+      actionArguments: {},
+      riskTier: 'high',
+      riskSummary: 'z',
+      status: 'denied',
+      expiresAt: new Date(Date.now() + 60_000),
+      decidedAt: new Date(),
+      decisionReason: null,
+      executionId: 'exec-77',
+      createdAt: new Date(),
+    };
+    const aiSet = vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
+    const approvalReturning = vi.fn().mockResolvedValue([deniedRow]);
+    const approvalSet = vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({ returning: approvalReturning }),
+    });
+    vi.mocked(db.update)
+      .mockReturnValueOnce({ set: approvalSet } as any)
+      .mockReturnValueOnce({ set: aiSet } as any);
+
+    const res = await buildApp().request('/approvals/a1/deny', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(200);
+    expect(aiSet).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'rejected', approvedBy: TEST_USER.id }),
+    );
   });
 });
 

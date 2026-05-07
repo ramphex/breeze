@@ -51,7 +51,8 @@
         {
           "faceIDPermission": "Allow Breeze RMM to use Face ID for authentication"
         }
-      ]
+      ],
+      "@sentry/react-native/expo"
     ],
     "extra": {
       "eas": {

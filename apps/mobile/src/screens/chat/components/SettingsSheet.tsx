@@ -41,6 +41,7 @@ const NOTIF_KEY = 'notificationsEnabled';
 const NOTIF_CRITICAL_ONLY_KEY = 'notificationsCriticalOnly';
 const TERMS_URL = 'https://breeze.io/terms';
 const PRIVACY_URL = 'https://breeze.io/privacy';
+const DELETE_ACCOUNT_URL = 'https://breezermm.com/account/delete';
 
 async function safeOpen(url: string) {
   try {
@@ -129,6 +130,21 @@ export function SettingsSheet({ visible, onCancel }: Props) {
     setToast({ kind: 'success', text: 'Password updated.' });
   }
 
+  function onPressDeleteAccount() {
+    Alert.alert(
+      'Delete account',
+      'You will be taken to a secure page on the web to submit a deletion request. Your account is processed within 30 days; you can cancel anytime before then.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          style: 'destructive',
+          onPress: () => safeOpen(DELETE_ACCOUNT_URL),
+        },
+      ],
+    );
+  }
+
   function onSignOut() {
     Alert.alert('Sign out', 'You will need to sign in again to receive approvals.', [
       { text: 'Cancel', style: 'cancel' },
@@ -182,6 +198,7 @@ export function SettingsSheet({ visible, onCancel }: Props) {
             onPressChangePassword={onPressChangePassword}
             onPressTerms={() => safeOpen(TERMS_URL)}
             onPressPrivacy={() => safeOpen(PRIVACY_URL)}
+            onPressDeleteAccount={onPressDeleteAccount}
             onSignOut={onSignOut}
           />
           {/* Toast inside the sliding container so its left/right gutters
@@ -221,6 +238,7 @@ function SheetBody({
   onPressChangePassword,
   onPressTerms,
   onPressPrivacy,
+  onPressDeleteAccount,
   onSignOut,
 }: {
   user: { name: string; email: string } | null;
@@ -238,6 +256,7 @@ function SheetBody({
   onPressChangePassword: () => void;
   onPressTerms: () => void;
   onPressPrivacy: () => void;
+  onPressDeleteAccount: () => void;
   onSignOut: () => void;
 }) {
   return (
@@ -314,6 +333,19 @@ function SheetBody({
         <LinkRow label="Privacy Policy" onPress={onPressPrivacy} theme={theme} />
 
         <SectionDivider color={theme.border} />
+
+        <Pressable
+          onPress={onPressDeleteAccount}
+          style={({ pressed }) => ({
+            paddingHorizontal: spacing[6],
+            paddingVertical: spacing[4],
+            backgroundColor: pressed ? theme.bg2 : 'transparent',
+          })}
+        >
+          <Text style={[type.bodyMd, { color: palette.deny.base }]}>
+            Delete account
+          </Text>
+        </Pressable>
 
         <Pressable
           onPress={onSignOut}

@@ -1,3 +1,4 @@
+export * from './accountDeletion';
 export * from './approvals';
 export * from './orgs';
 export * from './oauth';

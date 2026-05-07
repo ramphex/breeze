@@ -1,27 +1,50 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { NavigationContainer, DefaultTheme as NavDefaultTheme } from '@react-navigation/native';
 import { View } from 'react-native';
+import * as Sentry from '@sentry/react-native';
 
 import { useAppSelector, useAppDispatch } from '../store';
 import { setCredentials, logout } from '../store/authSlice';
 import { getStoredToken, getStoredUser, clearAuthData } from '../services/auth';
 import { getCurrentUser } from '../services/api';
+import {
+  getOnboardingCompleted,
+  setOnboardingCompleted,
+} from '../services/onboarding';
 import { AuthNavigator } from './AuthNavigator';
 import { MainNavigator } from './MainNavigator';
 import { ApprovalGate } from './ApprovalGate';
+import { OnboardingScreen } from '../screens/onboarding/OnboardingScreen';
 import { Spinner } from '../components/Spinner';
 import { palette } from '../theme';
 
 export function RootNavigator() {
   const dispatch = useAppDispatch();
-  const { token, isLoading } = useAppSelector((state) => state.auth);
+  const { token, isLoading, user } = useAppSelector((state) => state.auth);
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  // null while we're still reading the persisted flag. Defaults to "completed"
+  // (true) on read errors so a corrupted AsyncStorage never traps users.
+  const [hasOnboarded, setHasOnboarded] = useState<boolean | null>(null);
+
+  // Attribute Sentry events to the signed-in user. Cleared on sign-out so
+  // crashes after logout are not falsely attributed to the previous account.
+  useEffect(() => {
+    if (user) {
+      Sentry.setUser({ id: user.id, email: user.email });
+    } else {
+      Sentry.setUser(null);
+    }
+  }, [user]);
 
   useEffect(() => {
     async function checkAuth() {
       try {
-        const storedToken = await getStoredToken();
-        const storedUser = await getStoredUser();
+        const [storedToken, storedUser, onboardingDone] = await Promise.all([
+          getStoredToken(),
+          getStoredUser(),
+          getOnboardingCompleted(),
+        ]);
+        setHasOnboarded(onboardingDone);
 
         if (!storedToken || !storedUser) {
           dispatch(logout());
@@ -75,7 +98,16 @@ export function RootNavigator() {
     },
   };
 
-  if (isCheckingAuth || isLoading) {
+  const handleOnboardingComplete = useCallback(() => {
+    // Persist first so a quick second mount doesn't replay the flow, then
+    // flip the in-memory flag to advance into MainNavigator.
+    setOnboardingCompleted().catch(() => {
+      // Best-effort; the in-memory transition still happens below.
+    });
+    setHasOnboarded(true);
+  }, []);
+
+  if (isCheckingAuth || isLoading || hasOnboarded === null) {
     return (
       <View
         style={{
@@ -93,9 +125,13 @@ export function RootNavigator() {
   return (
     <NavigationContainer theme={navigationTheme}>
       {token ? (
-        <ApprovalGate>
-          <MainNavigator />
-        </ApprovalGate>
+        hasOnboarded ? (
+          <ApprovalGate>
+            <MainNavigator />
+          </ApprovalGate>
+        ) : (
+          <OnboardingScreen onComplete={handleOnboardingComplete} />
+        )
       ) : (
         <AuthNavigator />
       )}

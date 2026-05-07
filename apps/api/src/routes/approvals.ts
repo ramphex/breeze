@@ -6,6 +6,7 @@ import { and, eq, gt, desc } from 'drizzle-orm';
 import { db } from '../db';
 import { authMiddleware } from '../middleware/auth';
 import { approvalRequests } from '../db/schema/approvals';
+import { aiToolExecutions } from '../db/schema/ai';
 import { buildApprovalPush, getUserPushTokens, sendExpoPush } from '../services/expoPush';
 
 export const approvalRoutes = new Hono();
@@ -174,6 +175,28 @@ async function decideHandler(
   }
 
   const [updated] = result;
+
+  // If this approval row was created by the AI agent SDK (Breeze AI / chat),
+  // it carries an `executionId` linking back to the ai_tool_executions row
+  // that the SDK is blocked on via waitForApproval(). Flip that row's status
+  // so the SDK's poll unblocks and the tool either executes or returns
+  // "rejected or timed out". For non-AI sources (helper, dev seed) execution_id
+  // is null and this is a no-op.
+  if (updated?.executionId) {
+    const aiStatus = status === 'approved' ? 'approved' : 'rejected';
+    try {
+      await db
+        .update(aiToolExecutions)
+        .set({ status: aiStatus, approvedBy: userId, approvedAt: new Date() })
+        .where(eq(aiToolExecutions.id, updated.executionId));
+    } catch (err) {
+      console.error('[approvals] Failed to mirror status to ai_tool_executions:', err);
+      // Non-fatal: the approval_request row is the source of truth for the
+      // mobile UI. The SDK poll will time out at the 5-min ceiling if the
+      // mirror fails — better than failing the user-facing decide call.
+    }
+  }
+
   return c.json({ approval: serialize(updated!) });
 }
 
@@ -191,6 +214,7 @@ function serialize(r: typeof approvalRequests.$inferSelect) {
     expiresAt: r.expiresAt.toISOString(),
     decidedAt: r.decidedAt?.toISOString() ?? null,
     decisionReason: r.decisionReason ?? null,
+    executionId: r.executionId ?? null,
     createdAt: r.createdAt.toISOString(),
   };
 }
