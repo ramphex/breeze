@@ -13,6 +13,7 @@ import {
   type MobileSummary,
   type OrganizationSummary,
 } from '../../services/systems';
+import { createSystemsRealtimeClient } from '../../services/systemsRealtime';
 
 export interface OrgRollup {
   id: string;
@@ -129,6 +130,25 @@ export function useSystemsData() {
     });
     return () => {
       removeNotificationSubscription(sub);
+    };
+  }, [fetchAll]);
+
+  // Subscribe to the realtime event stream. This catches state changes
+  // that happen silently while the app is foregrounded (acks/resolves
+  // from the web, alert auto-resolves, escalations) — push notifications
+  // only fire on `triggered`. Additive: if the WS is unreachable we still
+  // have pull-to-refresh + tab-focus debounce + push.
+  useEffect(() => {
+    const client = createSystemsRealtimeClient();
+    const unsubscribe = client.subscribe(() => {
+      // We don't try to apply event payloads locally — refetching keeps
+      // the rendered state the single source of truth and avoids divergent
+      // optimistic logic. fetchAll is in-flight-guarded.
+      void fetchAll('refresh');
+    });
+    return () => {
+      unsubscribe();
+      client.close();
     };
   }, [fetchAll]);
 

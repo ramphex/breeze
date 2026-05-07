@@ -1,10 +1,11 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import { and, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, ilike, inArray, like, or, sql } from 'drizzle-orm';
 import { createHash } from 'crypto';
 import { db } from '../db';
 import {
+  aiSessions,
   alerts,
   alertRules,
   alertTemplates,
@@ -12,9 +13,11 @@ import {
   devices,
   mobileDevices,
   scriptExecutions,
-  scripts
+  scripts,
+  sites
 } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { userRateLimit } from '../middleware/userRateLimit';
 import { setCooldown, markConfigPolicyRuleCooldown } from '../services/alertCooldown';
 import { writeRouteAudit } from '../services/auditEvents';
 import { publishEvent } from '../services/eventBus';
@@ -980,5 +983,255 @@ mobileRoutes.get(
         critical: Number(alertStats[0]?.critical ?? 0)
       }
     });
+  }
+);
+
+// GET /search - Unified mobile search across devices, alerts, AI sessions
+const searchQuerySchema = z.object({
+  q: z.string().trim().min(1).max(100),
+  limit: z.coerce.number().int().min(1).max(50).optional()
+});
+
+type SearchResult =
+  | {
+      kind: 'device';
+      id: string;
+      title: string;
+      subtitle: string;
+      meta: {
+        orgId: string;
+        siteId: string | null;
+        hostname: string | null;
+        displayName: string | null;
+        osType: string | null;
+        status: string | null;
+        lastSeenAt: string | null;
+        siteName: string | null;
+      };
+    }
+  | {
+      kind: 'alert';
+      id: string;
+      title: string;
+      subtitle: string;
+      meta: {
+        orgId: string;
+        severity: string;
+        status: string;
+        deviceId: string | null;
+        deviceName: string | null;
+        message: string | null;
+        triggeredAt: string | null;
+      };
+    }
+  | {
+      kind: 'session';
+      id: string;
+      title: string;
+      subtitle: string;
+      meta: {
+        orgId: string;
+        status: string;
+        turnCount: number;
+        lastActivityAt: string | null;
+        createdAt: string | null;
+      };
+    };
+
+mobileRoutes.get(
+  '/search',
+  requireScope('organization', 'partner', 'system'),
+  userRateLimit('mobile-search', 30, 60),
+  zValidator('query', searchQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { q, limit = 20 } = c.req.valid('query');
+
+    const orgCheck = await getOrgIdsForAuth(auth);
+    if (orgCheck.error) {
+      return c.json({ error: orgCheck.error.message }, orgCheck.error.status as 400 | 403 | 404);
+    }
+    if (orgCheck.orgIds !== null && orgCheck.orgIds.length === 0) {
+      return c.json({ results: [] });
+    }
+
+    const term = `%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`;
+    const cappedLimit = Math.min(50, Math.max(1, limit));
+    // Distribute results so one kind never starves others. Each kind gets
+    // up to ~ceil(limit/3) candidates; we then trim to cappedLimit total.
+    const perKind = Math.max(2, Math.ceil(cappedLimit / 3));
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const orgFilter = orgCheck.orgIds === null ? undefined : inArray;
+
+    const deviceWhere = and(
+      orgCheck.orgIds === null ? sql`true` : inArray(devices.orgId, orgCheck.orgIds),
+      or(
+        ilike(devices.hostname, term),
+        ilike(devices.displayName, term),
+        ilike(sql`${devices.osType}::text`, term),
+        ilike(sites.name, term)
+      )
+    );
+
+    const alertWhere = and(
+      orgCheck.orgIds === null ? sql`true` : inArray(alerts.orgId, orgCheck.orgIds),
+      gte(alerts.triggeredAt, thirtyDaysAgo),
+      or(ilike(alerts.title, term), ilike(alerts.message, term))
+    );
+
+    const sessionWhere = and(
+      orgCheck.orgIds === null ? sql`true` : inArray(aiSessions.orgId, orgCheck.orgIds),
+      gte(aiSessions.lastActivityAt, thirtyDaysAgo),
+      ilike(aiSessions.title, term)
+    );
+
+    // Suppress the unused-import lint when orgCheck.orgIds is null.
+    void orgFilter;
+
+    const [deviceRows, alertRows, sessionRows] = await Promise.all([
+      db
+        .select({
+          id: devices.id,
+          orgId: devices.orgId,
+          siteId: devices.siteId,
+          hostname: devices.hostname,
+          displayName: devices.displayName,
+          osType: devices.osType,
+          status: devices.status,
+          lastSeenAt: devices.lastSeenAt,
+          siteName: sites.name
+        })
+        .from(devices)
+        .leftJoin(sites, eq(devices.siteId, sites.id))
+        .where(deviceWhere)
+        .orderBy(desc(devices.lastSeenAt))
+        .limit(perKind),
+      db
+        .select({
+          id: alerts.id,
+          orgId: alerts.orgId,
+          severity: alerts.severity,
+          status: alerts.status,
+          title: alerts.title,
+          message: alerts.message,
+          triggeredAt: alerts.triggeredAt,
+          deviceId: alerts.deviceId,
+          deviceHostname: devices.hostname,
+          deviceDisplayName: devices.displayName
+        })
+        .from(alerts)
+        .leftJoin(devices, eq(alerts.deviceId, devices.id))
+        .where(alertWhere)
+        .orderBy(desc(alerts.triggeredAt))
+        .limit(perKind),
+      db
+        .select({
+          id: aiSessions.id,
+          orgId: aiSessions.orgId,
+          title: aiSessions.title,
+          status: aiSessions.status,
+          turnCount: aiSessions.turnCount,
+          lastActivityAt: aiSessions.lastActivityAt,
+          createdAt: aiSessions.createdAt
+        })
+        .from(aiSessions)
+        .where(sessionWhere)
+        .orderBy(desc(aiSessions.lastActivityAt))
+        .limit(perKind)
+    ]);
+
+    const severityRank: Record<string, number> = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      low: 3,
+      info: 4
+    };
+
+    const deviceResults: SearchResult[] = deviceRows.map((row) => {
+      const title = row.displayName?.trim() || row.hostname || 'Untitled device';
+      const subtitleParts = [
+        row.osType ?? null,
+        row.siteName ?? null,
+        row.status ?? null
+      ].filter((v): v is string => Boolean(v));
+      return {
+        kind: 'device' as const,
+        id: row.id,
+        title,
+        subtitle: subtitleParts.join(' · '),
+        meta: {
+          orgId: row.orgId,
+          siteId: row.siteId ?? null,
+          hostname: row.hostname ?? null,
+          displayName: row.displayName ?? null,
+          osType: row.osType ?? null,
+          status: row.status ?? null,
+          lastSeenAt: row.lastSeenAt ? new Date(row.lastSeenAt).toISOString() : null,
+          siteName: row.siteName ?? null
+        }
+      };
+    });
+
+    const alertResults: SearchResult[] = alertRows.map((row) => {
+      const deviceName = row.deviceHostname || row.deviceDisplayName || null;
+      const subtitleParts = [row.severity, deviceName].filter((v): v is string => Boolean(v));
+      return {
+        kind: 'alert' as const,
+        id: row.id,
+        title: row.title,
+        subtitle: subtitleParts.join(' · '),
+        meta: {
+          orgId: row.orgId,
+          severity: row.severity,
+          status: row.status,
+          deviceId: row.deviceId ?? null,
+          deviceName,
+          message: row.message ?? null,
+          triggeredAt: row.triggeredAt ? new Date(row.triggeredAt).toISOString() : null
+        }
+      };
+    });
+
+    const sessionResults: SearchResult[] = sessionRows.map((row) => ({
+      kind: 'session' as const,
+      id: row.id,
+      title: row.title?.trim() || 'Untitled conversation',
+      subtitle: `${row.turnCount} turn${row.turnCount === 1 ? '' : 's'}`,
+      meta: {
+        orgId: row.orgId,
+        status: row.status,
+        turnCount: row.turnCount,
+        lastActivityAt: row.lastActivityAt ? new Date(row.lastActivityAt).toISOString() : null,
+        createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : null
+      }
+    }));
+
+    // Severity-then-kind ordering: alerts sort by severity, devices and
+    // sessions interleave by kind below. We round-robin to avoid one kind
+    // monopolising the cap.
+    alertResults.sort((a, b) => {
+      const aRank = severityRank[(a.meta as { severity: string }).severity] ?? 99;
+      const bRank = severityRank[(b.meta as { severity: string }).severity] ?? 99;
+      return aRank - bRank;
+    });
+
+    const merged: SearchResult[] = [];
+    const queues: SearchResult[][] = [alertResults, deviceResults, sessionResults];
+    while (merged.length < cappedLimit) {
+      let pulled = false;
+      for (const queue of queues) {
+        if (merged.length >= cappedLimit) break;
+        const next = queue.shift();
+        if (next) {
+          merged.push(next);
+          pulled = true;
+        }
+      }
+      if (!pulled) break;
+    }
+
+    return c.json({ results: merged });
   }
 );

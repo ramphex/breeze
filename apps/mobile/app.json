@@ -16,7 +16,9 @@
       "bundleIdentifier": "com.breeze.rmm",
       "infoPlist": {
         "NSFaceIDUsageDescription": "Use Face ID to unlock the app",
-        "NSCameraUsageDescription": "Camera access for QR code scanning"
+        "NSCameraUsageDescription": "Camera access for QR code scanning",
+        "NSSpeechRecognitionUsageDescription": "Use voice to ask Breeze about your fleet.",
+        "NSMicrophoneUsageDescription": "Use voice to ask Breeze about your fleet."
       }
     },
     "android": {
@@ -50,6 +52,13 @@
         "expo-local-authentication",
         {
           "faceIDPermission": "Allow Breeze RMM to use Face ID for authentication"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Use voice to ask Breeze about your fleet.",
+          "speechRecognitionPermission": "Use voice to ask Breeze about your fleet."
         }
       ],
       "@sentry/react-native/expo"
