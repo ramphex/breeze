@@ -39,8 +39,8 @@ interface Props {
 
 const NOTIF_KEY = 'notificationsEnabled';
 const NOTIF_CRITICAL_ONLY_KEY = 'notificationsCriticalOnly';
-const TERMS_URL = 'https://breeze.io/terms';
-const PRIVACY_URL = 'https://breeze.io/privacy';
+const TERMS_URL = 'https://breezermm.com/legal/terms-of-service/';
+const PRIVACY_URL = 'https://breezermm.com/legal/privacy-policy/';
 const DELETE_ACCOUNT_URL = 'https://breezermm.com/account/delete';
 
 async function safeOpen(url: string) {
