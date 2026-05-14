@@ -12,6 +12,7 @@ import {
   isReleaseArtifactManifestVerificationConfigured,
   verifyReleaseArtifactManifestAsset,
 } from "./releaseArtifactManifest";
+import { ensureActiveSigningKey, signManifest } from "./manifestSigning";
 
 const GITHUB_REPO = process.env.GITHUB_REPO || "LanternOps/breeze";
 
@@ -322,10 +323,28 @@ export async function syncBinaries(): Promise<void> {
       process.env.BREEZE_SERVER ||
       `http://localhost:${process.env.API_PORT || "3001"}`;
 
+    // Sign every locally-registered manifest so /agent-versions/:v/download
+    // returns 200 (the strict-signing check from #568 hard-rejects null
+    // manifest fields). Key is generated lazily on first call and reused
+    // across the loop. See docs/deploy/agent-update-trust-bootstrap.md.
+    const { keyId } = await ensureActiveSigningKey();
+
     await db.transaction(async (tx) => {
       for (const bin of binaries) {
         const osParam = bin.platform === "macos" ? "darwin" : bin.platform;
         const downloadUrl = `${serverUrl}/api/v1/agents/download/${osParam}/${bin.architecture}`;
+
+        const manifestObj = {
+          version,
+          component: "agent",
+          platform: bin.platform,
+          arch: bin.architecture,
+          url: downloadUrl,
+          checksum: bin.checksum,
+          size: Number(bin.fileSize),
+        };
+        const releaseManifest = JSON.stringify(manifestObj);
+        const manifestSignature = await signManifest(releaseManifest);
 
         // Demote existing "isLatest" entries for this platform/arch
         await tx
@@ -350,18 +369,28 @@ export async function syncBinaries(): Promise<void> {
             checksum: bin.checksum,
             fileSize: bin.fileSize,
             isLatest: true,
+            releaseManifest,
+            manifestSignature,
+            signingKeyId: keyId,
           })
           .onConflictDoUpdate({
+            // Match the actual unique constraint
+            // (version, platform, architecture, component). `component`
+            // defaults to 'agent' in the schema for the local-binary path.
             target: [
               agentVersions.version,
               agentVersions.platform,
               agentVersions.architecture,
+              agentVersions.component,
             ],
             set: {
               downloadUrl,
               checksum: bin.checksum,
               fileSize: bin.fileSize,
               isLatest: true,
+              releaseManifest,
+              manifestSignature,
+              signingKeyId: keyId,
             },
           });
       }
@@ -416,12 +445,24 @@ export async function syncFromGitHub(
     ? `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${requestedVersion}`
     : `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 
-  const ghResp = await fetch(ghUrl, {
-    headers: {
-      Accept: "application/vnd.github.v3+json",
-      "User-Agent": "breeze-api",
-    },
-  });
+  // Authenticate the API call when a token is available. Unauthenticated
+  // requests are capped at 60/hour per IP — fine for prod droplets where
+  // binarySync runs once at boot, but breaks shared-IP environments like
+  // CI runners. Operators behind NAT with multiple deployments may also
+  // benefit. Token is opt-in via env; no breaking change for existing
+  // deployments. Accepts both GITHUB_TOKEN (used by GitHub Actions) and
+  // GH_TOKEN (used by the gh CLI).
+  const ghToken =
+    process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim();
+  const ghHeaders: Record<string, string> = {
+    Accept: "application/vnd.github.v3+json",
+    "User-Agent": "breeze-api",
+  };
+  if (ghToken) {
+    ghHeaders.Authorization = `Bearer ${ghToken}`;
+  }
+
+  const ghResp = await fetch(ghUrl, { headers: ghHeaders });
   if (!ghResp.ok) {
     throw new Error(`GitHub API error: ${ghResp.status}`);
   }

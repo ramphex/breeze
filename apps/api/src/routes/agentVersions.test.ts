@@ -15,6 +15,15 @@ vi.mock("../db", () => ({
   },
 }));
 
+vi.mock("../services/manifestSigning", () => ({
+  // Simulate no DB-provisioned deployment keys by default so tests that
+  // don't set env vars still get a soft-pass (no env + no DB = empty keyset).
+  getActivePublicKeys: vi.fn().mockResolvedValue([]),
+  getActiveTrustKeyset: vi.fn().mockResolvedValue([]),
+  ensureActiveSigningKey: vi.fn().mockResolvedValue({ keyId: "test-key", publicKeyB64: "" }),
+  signManifest: vi.fn().mockResolvedValue("test-signature"),
+}));
+
 vi.mock("../services/auditEvents", () => ({
   writeRouteAudit: vi.fn(),
 }));
@@ -26,8 +35,9 @@ vi.mock("../middleware/auth", () => ({
   requireMfa: () => vi.fn(async (_c: any, next: any) => next()),
 }));
 
-import { agentVersionRoutes } from "./agentVersions";
+import { agentVersionRoutes, validateReleaseManifest } from "./agentVersions";
 import { db } from "../db";
+import * as manifestSigning from "../services/manifestSigning";
 
 function makeSignedReleaseManifest(overrides: Record<string, unknown> = {}) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -289,6 +299,155 @@ describe("agentVersions routes", () => {
       expect(body.manifestSignature).toBe(signed.signature);
     });
 
+    it("rewrites downloadUrl to server-relative when PUBLIC_API_URL is set (#646 — hosted SaaS auto-update fix)", async () => {
+      const checksum = "b".repeat(64);
+      const signed = makeSignedReleaseManifest({
+        platform: "windows",
+        arch: "amd64",
+        url: "https://github.com/LanternOps/breeze/releases/download/v1.0.0/breeze-agent-windows-amd64.exe",
+        checksum,
+        size: 1234,
+      });
+
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              {
+                version: "1.0.0",
+                platform: "windows",
+                architecture: "amd64",
+                component: "agent",
+                downloadUrl:
+                  "https://github.com/LanternOps/breeze/releases/download/v1.0.0/breeze-agent-windows-amd64.exe",
+                checksum,
+                fileSize: BigInt(1234),
+                releaseManifest: signed.manifest,
+                manifestSignature: signed.signature,
+                signingKeyId: "test-key",
+              },
+            ]),
+          }),
+        }),
+      } as any);
+
+      process.env.PUBLIC_API_URL = "https://us.example.com";
+      try {
+        const res = await app.request(
+          "/agent-versions/1.0.0/download?platform=windows&arch=amd64",
+        );
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        // Server-relative URL so the agent's downloadFromURL host check
+        // passes. The actual binary is served via /agents/download/:os/:arch
+        // (which 302s to github in BINARY_SOURCE=github mode).
+        expect(body.url).toBe(
+          "https://us.example.com/api/v1/agents/download/windows/amd64",
+        );
+        expect(body.checksum).toBe(checksum);
+        // Manifest stays unmodified — its url field still references the
+        // canonical github URL. The agent (v0.65.10+) accepts the mismatch
+        // because checksum is the trust binding.
+        expect(body.manifest).toBe(signed.manifest);
+      } finally {
+        delete process.env.PUBLIC_API_URL;
+      }
+    });
+
+    it("maps platform=macos to /darwin in the server-relative URL", async () => {
+      const checksum = "b".repeat(64);
+      const signed = makeSignedReleaseManifest({
+        platform: "macos",
+        arch: "arm64",
+        url: "https://github.com/LanternOps/breeze/releases/download/v1.0.0/breeze-agent-darwin-arm64",
+        checksum,
+        size: 1234,
+      });
+
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              {
+                version: "1.0.0",
+                platform: "macos",
+                architecture: "arm64",
+                component: "agent",
+                downloadUrl:
+                  "https://github.com/LanternOps/breeze/releases/download/v1.0.0/breeze-agent-darwin-arm64",
+                checksum,
+                fileSize: BigInt(1234),
+                releaseManifest: signed.manifest,
+                manifestSignature: signed.signature,
+                signingKeyId: "test-key",
+              },
+            ]),
+          }),
+        }),
+      } as any);
+
+      process.env.PUBLIC_API_URL = "https://us.example.com";
+      try {
+        const res = await app.request(
+          "/agent-versions/1.0.0/download?platform=darwin&arch=arm64",
+        );
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.url).toBe(
+          "https://us.example.com/api/v1/agents/download/darwin/arm64",
+        );
+      } finally {
+        delete process.env.PUBLIC_API_URL;
+      }
+    });
+
+    it("keeps canonical github URL for component=helper (download route is agent-only)", async () => {
+      const canonical =
+        "https://github.com/LanternOps/breeze/releases/download/v1.0.0/breeze-helper-windows.msi";
+      const checksum = "b".repeat(64);
+      const signed = makeSignedReleaseManifest({
+        component: "helper",
+        platform: "windows",
+        arch: "amd64",
+        url: canonical,
+        checksum,
+        size: 1234,
+      });
+
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              {
+                version: "1.0.0",
+                platform: "windows",
+                architecture: "amd64",
+                component: "helper",
+                downloadUrl: canonical,
+                checksum,
+                fileSize: BigInt(1234),
+                releaseManifest: signed.manifest,
+                manifestSignature: signed.signature,
+                signingKeyId: "test-key",
+              },
+            ]),
+          }),
+        }),
+      } as any);
+
+      process.env.PUBLIC_API_URL = "https://us.example.com";
+      try {
+        const res = await app.request(
+          "/agent-versions/1.0.0/download?platform=windows&arch=amd64&component=helper",
+        );
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.url).toBe(canonical);
+      } finally {
+        delete process.env.PUBLIC_API_URL;
+      }
+    });
+
     it("should return 404 for unknown version", async () => {
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
@@ -426,5 +585,79 @@ describe("agentVersions routes", () => {
 
       expect(res.status).toBe(400);
     });
+  });
+});
+
+describe("validateReleaseManifest — fail-closed behaviour (#625 C3)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.AGENT_UPDATE_MANIFEST_PUBLIC_KEYS;
+    delete process.env.BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS;
+    delete process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS;
+    delete process.env.BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS;
+  });
+
+  it("fails closed when DB lookup throws and no env keys are configured", async () => {
+    // Before this fix (C3), getUpdateManifestPublicKeys silently swallowed
+    // the DB error, returned keys.length === 0, and verifyEd25519Manifest
+    // Signature returned true — bypassing signature verification entirely.
+    vi.spyOn(manifestSigning, "getActivePublicKeys").mockRejectedValue(
+      new Error("connection refused"),
+    );
+
+    const result = await validateReleaseManifest({
+      manifest: JSON.stringify({
+        version: "0.65.9",
+        component: "agent",
+        platform: "linux",
+        arch: "amd64",
+        url: "http://x",
+        checksum: "a".repeat(64),
+        size: 1,
+      }),
+      signature: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      version: "0.65.9",
+      platform: "linux",
+      arch: "amd64",
+      component: "agent",
+      downloadUrl: "http://x",
+      checksum: "a".repeat(64),
+      fileSize: 1,
+    });
+
+    expect(result.ok).toBe(false);
+  });
+
+  it("soft-passes when DB returns no keys and no env keys are configured (hosted SaaS empty-keyset intent)", async () => {
+    // Empty because neither env vars nor DB rows are set — this is the normal
+    // hosted-SaaS state where agents trust the LanternOps build-time key
+    // directly and the API has no deployment signing key. Must remain a
+    // soft-pass so hosted agents can download updates.
+    vi.spyOn(manifestSigning, "getActivePublicKeys").mockResolvedValue([]);
+
+    const manifestObj = {
+      version: "0.65.9",
+      component: "agent",
+      platform: "linux",
+      arch: "amd64",
+      url: "http://x",
+      checksum: "a".repeat(64),
+      size: 1,
+    };
+
+    const result = await validateReleaseManifest({
+      manifest: JSON.stringify(manifestObj),
+      // Signature is ignored when keyset is intentionally empty (soft-pass).
+      signature: "A".repeat(88),
+      version: "0.65.9",
+      platform: "linux",
+      arch: "amd64",
+      component: "agent",
+      downloadUrl: "http://x",
+      checksum: "a".repeat(64),
+      fileSize: 1,
+    });
+
+    expect(result.ok).toBe(true);
   });
 });

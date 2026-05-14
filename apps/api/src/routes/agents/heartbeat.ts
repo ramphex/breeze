@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { zValidator } from '@hono/zod-validator';
 import { and, desc, eq } from 'drizzle-orm';
-import { db } from '../../db';
+import { db, runOutsideDbContext } from '../../db';
 import {
   devices,
   deviceMetrics,
@@ -27,6 +27,7 @@ import { isAgentTokenRotationDue } from '../../middleware/agentAuth';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
 import { captureException } from '../../services/sentry';
 import { resolveRemoteAccessForDevice } from '../../services/remoteAccessPolicy';
+import { getActiveTrustKeyset, type ManifestTrustKey } from '../../services/manifestSigning';
 
 export const heartbeatRoutes = new Hono();
 
@@ -50,7 +51,22 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   }
 
   if (data.role && data.role !== agent.role) {
-    return c.json({ error: 'Agent credential role mismatch' }, 403);
+    // Return 401 with re_enrollment_required so the watchdog/agent can drop its
+    // stale token and re-provision via IPC or /rotate-token. A 403 here causes
+    // a stale pre-#568 watchdog binary (using the main agent token but declaring
+    // role=watchdog) to retry forever; the agent's authstate.Monitor only backs
+    // off on 401, so this is what breaks the loop.
+    console.warn('[heartbeat] Agent credential role mismatch', {
+      deviceId: agent.deviceId,
+      expected: agent.role,
+      declared: data.role,
+    });
+    return c.json({
+      error: 'Agent credential role mismatch',
+      code: 're_enrollment_required',
+      expected: agent.role,
+      declared: data.role,
+    }, 401);
   }
 
   const isWatchdog = agent.role === 'watchdog';
@@ -412,6 +428,23 @@ if (latestHelper) {
     console.error('[heartbeat] Failed to resolve remote access policy:', err);
   }
 
+  // Returns the active signing keyset from manifest_signing_keys. On hosted
+  // SaaS the table is empty because nothing in the GitHub-source path calls
+  // ensureActiveSigningKey(); on self-host (BINARY_SOURCE=local) syncBinaries
+  // populates it. See docs/deploy/agent-update-trust-bootstrap.md (#625).
+  // runOutsideDbContext is required because this handler runs inside an
+  // agentAuthMiddleware withDbAccessContext(organization) scope, which would
+  // suppress the inner withSystemDbAccessContext inside getActiveTrustKeyset
+  // (short-circuit at db/index.ts:103-105), causing the RLS policy
+  // manifest_signing_keys_system_only to return zero rows.
+  let manifestTrustKeys: ManifestTrustKey[] = [];
+  try {
+    manifestTrustKeys = await runOutsideDbContext(() => getActiveTrustKeyset());
+  } catch (err) {
+    console.error(`[heartbeat] Failed to load manifest trust keyset for agentId=${agentId}:`, err);
+    captureException(err);
+  }
+
   return c.json({
     commands: commands.map(cmd => ({
       id: cmd.id,
@@ -427,6 +460,7 @@ if (latestHelper) {
     helperEnabled: helperSettings?.enabled ?? false,
     helperSettings: helperSettings ?? undefined,
     manageRemoteManagement: manageRemoteManagement || undefined,
+    manifestTrustKeys,
   });
 });
 

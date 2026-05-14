@@ -27,7 +27,37 @@ vi.mock("../db", () => ({
   },
 }));
 
-import { syncFromGitHub } from "./binarySync";
+const fsMocks = vi.hoisted(() => ({
+  readdir: vi.fn(),
+  readFile: vi.fn(),
+  stat: vi.fn(),
+}));
+
+vi.mock("node:fs/promises", () => fsMocks);
+
+vi.mock("node:fs", () => ({
+  createReadStream: () => {
+    const { Readable } = require("node:stream");
+    return Readable.from(Buffer.from("local agent bytes"));
+  },
+}));
+
+vi.mock("./s3Storage", () => ({
+  isS3Configured: () => false,
+  syncDirectory: vi.fn(),
+}));
+
+const manifestSigningMocks = vi.hoisted(() => ({
+  ensureActiveSigningKey: vi.fn(async () => ({
+    keyId: "deploy-test-aaaaaaaa",
+    publicKeyB64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  })),
+  signManifest: vi.fn(async () => "test-signature-base64"),
+}));
+
+vi.mock("./manifestSigning", () => manifestSigningMocks);
+
+import { syncBinaries, syncFromGitHub } from "./binarySync";
 
 function makeSignedReleaseManifest(assetName: string, assetBuffer: Buffer) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -143,5 +173,81 @@ describe("binarySync", () => {
         }),
       }),
     );
+  });
+
+  it("populates releaseManifest, manifestSignature, signingKeyId in local-binary mode (closes: #625)", async () => {
+    // v0.65.8 broke self-host updates by hard-rejecting null manifest fields
+    // in /agent-versions/:v/download. The local-binary path now signs every
+    // upserted row with the per-deployment Ed25519 key.
+    process.env.BINARY_SOURCE = "local";
+    process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    delete process.env.BREEZE_VERSION;
+
+    fsMocks.readdir.mockResolvedValue(["breeze-agent-linux-amd64"] as any);
+    fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 4096 } as any);
+    fsMocks.readFile.mockResolvedValue("0.65.9" as any);
+
+    await syncBinaries();
+
+    expect(manifestSigningMocks.ensureActiveSigningKey).toHaveBeenCalled();
+    expect(manifestSigningMocks.signManifest).toHaveBeenCalled();
+
+    const insertCalls = dbMocks.insertValues.mock.calls.map(
+      (call: any[]) => call[0] as Record<string, unknown>,
+    );
+    expect(insertCalls.length).toBeGreaterThan(0);
+    for (const values of insertCalls) {
+      expect(values.releaseManifest).toEqual(expect.any(String));
+      expect(values.manifestSignature).toBe("test-signature-base64");
+      expect(values.signingKeyId).toBe("deploy-test-aaaaaaaa");
+      // Manifest must include the canonical fields validated by
+      // /agent-versions/:v/download's validateReleaseManifest().
+      const manifest = JSON.parse(values.releaseManifest as string);
+      expect(manifest).toMatchObject({
+        version: "0.65.9",
+        component: "agent",
+        platform: "linux",
+        arch: "amd64",
+      });
+      expect(manifest.url).toContain("/agents/download/linux/amd64");
+      expect(manifest.checksum).toEqual(expect.any(String));
+    }
+
+    const conflictSets = dbMocks.onConflictDoUpdate.mock.calls.map(
+      (call: any[]) => (call[0] as { set: Record<string, unknown> }).set,
+    );
+    for (const set of conflictSets) {
+      expect(set.releaseManifest).toEqual(expect.any(String));
+      expect(set.manifestSignature).toBe("test-signature-base64");
+      expect(set.signingKeyId).toBe("deploy-test-aaaaaaaa");
+    }
+  });
+
+  it("upserts local agent binaries with the full 4-column conflict target (regression: #617)", async () => {
+    // The agent_versions table has a UNIQUE constraint on
+    // (version, platform, architecture, component). The local-binary path used
+    // to omit `component`, so Postgres rejected the upsert with
+    // "no unique or exclusion constraint matching the ON CONFLICT
+    // specification" and the wrapping transaction rolled back, leaving
+    // agent_versions empty after every API restart.
+    process.env.BINARY_SOURCE = "local";
+    process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    delete process.env.BREEZE_VERSION;
+
+    fsMocks.readdir.mockResolvedValue(["breeze-agent-linux-amd64"] as any);
+    fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 1234 } as any);
+    fsMocks.readFile.mockResolvedValue("0.65.7" as any);
+
+    await syncBinaries();
+
+    const targets = dbMocks.onConflictDoUpdate.mock.calls.map(
+      (call: any[]) => (call[0] as { target: unknown[] }).target,
+    );
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) {
+      expect(target).toHaveLength(4);
+    }
   });
 });

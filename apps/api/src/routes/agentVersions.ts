@@ -15,6 +15,7 @@ import { writeRouteAudit } from "../services/auditEvents";
 import { syncFromGitHub } from "../services/binarySync";
 import { PERMISSIONS } from "../services/permissions";
 import { verifyReleaseArtifactManifestAsset } from "../services/releaseArtifactManifest";
+import { getActivePublicKeys as getActiveDeploymentSigningPubKeys } from "../services/manifestSigning";
 
 // Map Go GOOS / user-facing platform names to DB platform names
 const PLATFORM_MAP: Record<string, string> = {
@@ -80,7 +81,7 @@ type ReleaseArtifactManifest = {
   assets?: unknown;
 };
 
-function getUpdateManifestPublicKeys(): Buffer[] {
+async function getUpdateManifestPublicKeys(): Promise<Buffer[]> {
   const configured = [
     process.env.AGENT_UPDATE_MANIFEST_PUBLIC_KEYS,
     process.env.BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS,
@@ -88,21 +89,58 @@ function getUpdateManifestPublicKeys(): Buffer[] {
     .filter((value): value is string => Boolean(value?.trim()))
     .join(",");
 
-  return configured
+  const fromEnv = configured
     .split(",")
     .map((value) => value.trim())
-    .filter(Boolean)
+    .filter(Boolean);
+
+  // Per-deployment signing keys (self-host BINARY_SOURCE=local). The set is
+  // small (typically one active key) and on a hot lookup path; cache layered
+  // higher up if this becomes a bottleneck. See #625.
+  let fromDb: string[] = [];
+  let dbLoadFailed = false;
+  try {
+    fromDb = await getActiveDeploymentSigningPubKeys();
+  } catch (err) {
+    console.warn(
+      `[agentVersions] Failed to load deployment signing pubkeys (failing closed):`,
+      err
+    );
+    dbLoadFailed = true;
+  }
+
+  const result = [...fromEnv, ...fromDb]
     .map((value) => Buffer.from(value, "base64"))
     .filter((key) => key.length === 32);
+
+  // Defense in depth: if the DB returned rows but every one decoded to a
+  // non-32-byte value (corrupt row, schema regression, encoding mismatch),
+  // the filter strips them all and we'd reach the empty-keyset soft-pass in
+  // verifyEd25519ManifestSignature with dbLoadFailed=false — silently
+  // accepting unsigned manifests. Treat that as a load failure.
+  if (fromDb.length > 0 && result.length === fromEnv.length) {
+    console.error(
+      `[agentVersions] manifest_signing_keys returned ${fromDb.length} row(s) but none decode to valid 32-byte Ed25519 keys — failing closed`,
+    );
+    dbLoadFailed = true;
+  }
+
+  // Tag the result so verifyEd25519ManifestSignature can fail closed when
+  // the only reason we have no keys is "DB load failed".
+  return Object.assign(result, { dbLoadFailed });
 }
 
-function verifyEd25519ManifestSignature(
+async function verifyEd25519ManifestSignature(
   manifest: string,
   signature: string,
-): boolean {
-  const keys = getUpdateManifestPublicKeys();
+): Promise<boolean> {
+  const keys = await getUpdateManifestPublicKeys();
   if (keys.length === 0) {
-    return true;
+    // Empty by intent (no env + no DB rows on a fresh hosted deploy) is a
+    // soft-pass. Empty *because the DB lookup threw* must fail closed —
+    // this used to be a silent verification bypass on transient DB outages
+    // for self-host (#625 review-CRIT-1).
+    return !(keys as { dbLoadFailed?: boolean }).dbLoadFailed;
   }
 
   let signatureBytes: Buffer;
@@ -149,7 +187,51 @@ function assetNameFromDownloadUrl(downloadUrl: string): string | null {
   }
 }
 
-async function validateReleaseManifest(args: {
+// Server-origin discovery for handing agents a download URL that matches
+// their configured control-plane host. The agent's downloadFromURL enforces
+// host equality with its ServerURL to prevent leaking the bearer token to a
+// third-party origin (e.g. github.com). When PUBLIC_API_URL is set, the
+// API rewrites the response's downloadUrl to a server-relative path; the
+// existing /api/v1/agents/download/:os/:arch route then 302s to github (or
+// streams locally) — credentials stay on the trusted origin. Issue #646.
+function getServerOriginForDownloadResponse(): string | null {
+  const candidate =
+    process.env.PUBLIC_API_URL?.trim() ||
+    process.env.PUBLIC_APP_URL?.trim() ||
+    process.env.BREEZE_SERVER?.trim();
+  if (!candidate) {
+    return null;
+  }
+  return candidate.replace(/\/+$/, "");
+}
+
+// Maps the DB platform value (which uses "macos") to the Go GOOS value that
+// the /api/v1/agents/download/:os/:arch route expects (which uses "darwin").
+function dbPlatformToRouteOs(dbPlatform: string): string {
+  return dbPlatform === "macos" ? "darwin" : dbPlatform;
+}
+
+// Construct the server-relative download URL the agent should use. Only
+// applies to component=agent today — helper/viewer auto-update flows have
+// their own update mechanisms and aren't served through the agent download
+// route. Returns null to signal "fall back to the canonical (github) URL".
+function buildServerRelativeAgentDownloadUrl(
+  dbPlatform: string,
+  architecture: string,
+  component: string,
+): string | null {
+  if (component !== "agent") {
+    return null;
+  }
+  const origin = getServerOriginForDownloadResponse();
+  if (!origin) {
+    return null;
+  }
+  const os = dbPlatformToRouteOs(dbPlatform);
+  return `${origin}/api/v1/agents/download/${os}/${architecture}`;
+}
+
+export async function validateReleaseManifest(args: {
   manifest: string | null | undefined;
   signature: string | null | undefined;
   version: string;
@@ -214,7 +296,7 @@ async function validateReleaseManifest(args: {
     return { ok: false, reason: "release_manifest_metadata_mismatch" };
   }
 
-  if (!verifyEd25519ManifestSignature(args.manifest, args.signature)) {
+  if (!(await verifyEd25519ManifestSignature(args.manifest, args.signature))) {
     return { ok: false, reason: "invalid_release_manifest_signature" };
   }
 
@@ -261,9 +343,19 @@ agentVersionRoutes.get(
       );
     }
 
+    const serverRelativeUrl = buildServerRelativeAgentDownloadUrl(
+      platform,
+      arch,
+      component,
+    );
+
     return c.json({
       version: latestVersion.version,
-      downloadUrl: latestVersion.downloadUrl,
+      // Server-relative URL when PUBLIC_API_URL is set (hosted SaaS); the
+      // existing /api/v1/agents/download/:os/:arch route redirects to github
+      // or serves locally. Otherwise fall back to the canonical URL stored
+      // in agent_versions. Issue #646.
+      downloadUrl: serverRelativeUrl ?? latestVersion.downloadUrl,
       checksum: latestVersion.checksum,
       releaseManifest: latestVersion.releaseManifest,
       manifestSignature: latestVersion.manifestSignature,
@@ -340,9 +432,19 @@ agentVersionRoutes.get(
       );
     }
 
+    const serverRelativeUrl = buildServerRelativeAgentDownloadUrl(
+      versionInfo.platform,
+      versionInfo.architecture,
+      versionInfo.component,
+    );
+
     // Return JSON with download URL, checksum, and signed release manifest.
+    // url is server-relative when PUBLIC_API_URL is set so the agent's
+    // host check passes; the binary itself is served via the existing
+    // /api/v1/agents/download/:os/:arch route (302 to github in
+    // BINARY_SOURCE=github mode, local stream otherwise). Issue #646.
     return c.json({
-      url: versionInfo.downloadUrl,
+      url: serverRelativeUrl ?? versionInfo.downloadUrl,
       checksum: versionInfo.checksum,
       manifest: versionInfo.releaseManifest,
       manifestSignature: versionInfo.manifestSignature,

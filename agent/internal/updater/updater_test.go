@@ -3,9 +3,11 @@ package updater
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -104,6 +106,57 @@ func signedReleaseArtifactDownloadInfo(t *testing.T, version, assetName, rawURL 
 		Manifest:          string(payload),
 		ManifestSignature: base64.StdEncoding.EncodeToString(signature),
 	}
+}
+
+// TestEmbeddedTrustRootMatchesRepoPubKey guards against shipping the agent
+// with an Ed25519 trust root that doesn't match the key the release pipeline
+// actually signs manifests with. PR #568 (May 2026) baked in a wrong key,
+// silently breaking auto-update for v0.65.5 and v0.65.6 — agents downloaded
+// the manifest, failed signature verification, and parked devices in
+// "updating" state forever. This test compares the embedded key against the
+// repo-tracked public key file (whose private counterpart is the GitHub
+// secret RELEASE_MANIFEST_ED25519_PRIVATE_KEY) so the same regression
+// can't slip in again.
+func TestEmbeddedTrustRootMatchesRepoPubKey(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve test file location via runtime.Caller")
+	}
+	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+	pubPath := filepath.Join(repoRoot, "internal", "release-keys", "release-manifest.ed25519.pub")
+
+	pemBytes, err := os.ReadFile(pubPath)
+	if err != nil {
+		t.Fatalf("repo manifest pub key not readable at %s: %v", pubPath, err)
+	}
+
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		t.Fatalf("expected a PEM PUBLIC KEY block in %s", pubPath)
+	}
+
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse SPKI from %s: %v", pubPath, err)
+	}
+	edKey, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		t.Fatalf("expected ed25519.PublicKey in %s, got %T", pubPath, parsed)
+	}
+	expected := base64.StdEncoding.EncodeToString(edKey)
+
+	for _, k := range trustedUpdateManifestPublicKeys {
+		if k == expected {
+			return
+		}
+	}
+	t.Fatalf(
+		"trustedUpdateManifestPublicKeys does not contain the repo manifest pub key.\n"+
+			"  expected (raw base64 of %s): %s\n"+
+			"  embedded: %v\n"+
+			"If you rotated the manifest signing key, update agent/internal/updater/updater.go to match.",
+		pubPath, expected, trustedUpdateManifestPublicKeys,
+	)
 }
 
 func TestNewCreatesUpdater(t *testing.T) {
@@ -464,6 +517,65 @@ func TestDownloadBinaryAcceptsSignedReleaseArtifactManifest(t *testing.T) {
 	}
 }
 
+// Regression for #646: the agent must accept a server-relative info.URL even
+// when the signed manifest references the canonical github.com asset URL.
+// Binary trust is bound by checksum (verified against the signed assets list),
+// not by URL string equality.
+func TestDownloadBinaryAcceptsServerRelativeUrlWithMatchingChecksum(t *testing.T) {
+	binaryContent := []byte("fake binary v1.0.0 served via server-relative proxy")
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	assetName := "breeze-agent-" + runtime.GOOS + "-" + runtime.GOARCH + suffix
+
+	// Signed manifest references the canonical github URL; the API hands back
+	// a server-relative URL pointing at its own proxy route.
+	canonicalAssetURL := "https://github.com/LanternOps/breeze/releases/download/v1.0.0/" + assetName
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/agent-versions/1.0.0/download":
+			signed := signedReleaseArtifactDownloadInfo(t, "1.0.0", assetName, canonicalAssetURL, binaryContent)
+			// Override the URL handed to the agent: server-relative proxy
+			// path, NOT the canonical (cross-origin) URL signed into the
+			// manifest. Manifest signature stays intact; manifest's Assets[]
+			// list still names the asset canonically.
+			signed.URL = "http://" + r.Host + "/api/v1/agents/download/" + runtime.GOOS + "/" + runtime.GOARCH
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(signed)
+		case r.URL.Path == "/api/v1/agents/download/"+runtime.GOOS+"/"+runtime.GOARCH:
+			// Stand-in for the existing /agents/download route which 302s to
+			// github in BINARY_SOURCE=github mode. For the test we just stream
+			// the bytes directly.
+			w.Write(binaryContent)
+		default:
+			t.Errorf("unexpected request path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	u := New(&Config{
+		ServerURL: server.URL,
+		AuthToken: secmem.NewSecureString("test-token"),
+	})
+	u.client = server.Client()
+
+	tempPath, manifest, err := u.downloadBinary("1.0.0")
+	if err != nil {
+		t.Fatalf("server-relative URL with matching checksum should be accepted: %v", err)
+	}
+	defer os.Remove(tempPath)
+	if manifest.Checksum == "" {
+		t.Fatal("expected manifest checksum to be returned")
+	}
+	downloaded, _ := os.ReadFile(tempPath)
+	if string(downloaded) != string(binaryContent) {
+		t.Fatalf("downloaded content mismatch")
+	}
+}
+
 func TestDownloadBinaryRejectsWrongSignedReleaseArtifact(t *testing.T) {
 	binaryContent := []byte("fake helper artifact")
 
@@ -738,5 +850,112 @@ func TestReplaceBinary_UnlinksBeforeWrite(t *testing.T) {
 	n, _ := holder.Read(oldContent)
 	if string(oldContent[:n]) != "old binary" {
 		t.Fatalf("held FD should still read old content, got: %s", string(oldContent[:n]))
+	}
+}
+
+// TestTrustedManifestKeys_IncludesPinnedKeys verifies that per-deployment
+// pinned pubkeys delivered via heartbeat/enrollment (#625) are included in
+// the trust set alongside the embedded LanternOps key.
+func TestTrustedManifestKeys_IncludesPinnedKeys(t *testing.T) {
+	pinnedRaw := make([]byte, ed25519.PublicKeySize)
+	for i := range pinnedRaw {
+		pinnedRaw[i] = byte(i + 1)
+	}
+	pinned := base64.StdEncoding.EncodeToString(pinnedRaw)
+
+	u := &Updater{
+		config: &Config{
+			PinnedManifestPubKeys: []string{"deploy-test:" + pinned},
+		},
+	}
+	keys := u.trustedManifestKeys()
+
+	// Embedded LanternOps key + the pinned key.
+	if len(keys) < 2 {
+		t.Fatalf("expected >= 2 trusted keys (embedded + pinned), got %d", len(keys))
+	}
+
+	// Verify the pinned bytes appear in the result.
+	found := false
+	for _, k := range keys {
+		if string(k) == string(pinnedRaw) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("pinned pubkey was not present in trustedManifestKeys output")
+	}
+}
+
+// TestVerifyUpdateManifest_AcceptsManifestSignedByPinnedKey exercises the full
+// per-deployment trust path end-to-end: generate a fresh Ed25519 keypair, sign
+// a manifest JSON, pin the pubkey via Config.PinnedManifestPubKeys, and assert
+// that verifyUpdateManifest accepts the manifest. This is the gap left by
+// TestTrustedManifestKeys_IncludesPinnedKeys, which only checked that the key
+// appears in the slice — not that the signature path actually works (#625).
+func TestVerifyUpdateManifest_AcceptsManifestSignedByPinnedKey(t *testing.T) {
+	// nil uses crypto/rand internally — same as the existing test helpers.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	manifest := updateManifest{
+		Version:   "0.65.9",
+		Component: "agent",
+		Platform:  manifestPlatform(),
+		Arch:      runtime.GOARCH,
+		URL:       "https://selftest.local/agent",
+		Checksum:  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Size:      4096,
+	}
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(priv, manifestJSON)
+	sigB64 := base64.StdEncoding.EncodeToString(sig)
+
+	u := &Updater{
+		config: &Config{
+			Component:             "agent",
+			PinnedManifestPubKeys: []string{"deploy-test:" + pubB64},
+		},
+	}
+	info := downloadInfo{
+		URL:               manifest.URL,
+		Checksum:          manifest.Checksum,
+		Manifest:          string(manifestJSON),
+		ManifestSignature: sigB64,
+	}
+	got, err := u.verifyUpdateManifest(info, "0.65.9")
+	if err != nil {
+		t.Fatalf("verifyUpdateManifest: %v", err)
+	}
+	if got.Version != "0.65.9" {
+		t.Fatalf("expected version 0.65.9, got %q", got.Version)
+	}
+}
+
+// TestTrustedManifestKeys_SkipsMalformedPinnedEntries ensures that bad entries
+// in the pinned list (no colon, blank pubkey, wrong base64) don't crash or
+// poison the trust set — they're just dropped.
+func TestTrustedManifestKeys_SkipsMalformedPinnedEntries(t *testing.T) {
+	u := &Updater{
+		config: &Config{
+			PinnedManifestPubKeys: []string{
+				"missing-colon",
+				"key-id:",
+				"key-id:not-valid-base64-!!!",
+				":",
+			},
+		},
+	}
+	keys := u.trustedManifestKeys()
+	// Just the embedded LanternOps key — all malformed entries dropped.
+	if len(keys) < 1 {
+		t.Fatalf("expected at least 1 (embedded) key, got %d", len(keys))
 	}
 }

@@ -34,6 +34,13 @@ type Config struct {
 	Component      string
 	BinaryPath     string
 	BackupPath     string
+
+	// PinnedManifestPubKeys are deployment-specific Ed25519 pubkeys delivered
+	// by the API via enrollment/heartbeat and pinned TOFU-style. Format
+	// matches agent config: "<keyId>:<base64-raw-pubkey>". Merged with the
+	// embedded LanternOps trust root in trustedManifestKeys() so self-host
+	// (BINARY_SOURCE=local) deployments can verify locally-signed manifests.
+	PinnedManifestPubKeys []string
 }
 
 // Updater handles agent auto-updates
@@ -61,10 +68,17 @@ var ErrTextBusy = fmt.Errorf("binary is currently executing")
 
 const maxUpdateBinaryBytes int64 = 500 * 1024 * 1024
 
+// trustedUpdateManifestPublicKeys is the embedded trust root for release
+// manifest signatures. It MUST match the raw Ed25519 public key in
+// internal/release-keys/release-manifest.ed25519.pub (the SPKI suffix); the
+// release.yml workflow signs every manifest with the corresponding private
+// key. TestEmbeddedTrustRootMatchesRepoPubKey enforces that match at build
+// time so the agent never ships with a mismatched trust root again.
+//
+// Self-hosters can append additional base64 raw Ed25519 public keys via the
+// BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS env var (read in trustedManifestKeys).
 var trustedUpdateManifestPublicKeys = []string{
-	// Breeze production update manifest trust root. Self-hosters can append
-	// additional base64 raw Ed25519 public keys with BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS.
-	"7eYBdr5+J5Rnwlil8FccFX/uAO8AnYxHmzVlhJnr++c=",
+	"yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso=",
 }
 
 type updateManifest struct {
@@ -155,11 +169,21 @@ func (u *Updater) expectedReleaseAssetNames() map[string]struct{} {
 	return map[string]struct{}{}
 }
 
-func trustedManifestKeys() []ed25519.PublicKey {
+func (u *Updater) trustedManifestKeys() []ed25519.PublicKey {
 	configured := strings.TrimSpace(os.Getenv("BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS"))
 	rawKeys := append([]string{}, trustedUpdateManifestPublicKeys...)
 	if configured != "" {
 		rawKeys = append(rawKeys, strings.Split(configured, ",")...)
+	}
+	// Per-deployment pinned keys delivered by the API via enrollment/heartbeat
+	// (see #625). Format on disk: "<keyId>:<base64-pubkey>".
+	if u != nil && u.config != nil {
+		for _, entry := range u.config.PinnedManifestPubKeys {
+			parts := strings.SplitN(entry, ":", 2)
+			if len(parts) == 2 && parts[1] != "" {
+				rawKeys = append(rawKeys, parts[1])
+			}
+		}
 	}
 
 	keys := make([]ed25519.PublicKey, 0, len(rawKeys))
@@ -339,7 +363,7 @@ func (u *Updater) verifyUpdateManifest(info downloadInfo, version string) (updat
 		return updateManifest{}, fmt.Errorf("invalid update manifest signature encoding")
 	}
 
-	keys := trustedManifestKeys()
+	keys := u.trustedManifestKeys()
 	if len(keys) == 0 {
 		return updateManifest{}, fmt.Errorf("no trusted update manifest public keys configured")
 	}
@@ -376,7 +400,13 @@ func (u *Updater) verifyUpdateManifest(info downloadInfo, version string) (updat
 	if manifest.Arch != runtime.GOARCH {
 		return updateManifest{}, fmt.Errorf("update manifest architecture mismatch: expected %s, got %s", runtime.GOARCH, manifest.Arch)
 	}
-	if manifest.URL != info.URL || manifest.Checksum != info.Checksum {
+	// The checksum equality below is the trust binding — it ties the
+	// signed manifest to the bytes the server is offering. We deliberately
+	// do NOT require manifest.URL == info.URL: the signed URL is canonical
+	// (e.g. github.com release artifact) while info.URL may be a server-
+	// relative proxy URL the API uses to keep the download flow inside the
+	// agent's trusted origin (see downloadFromURL host check). Issue #646.
+	if manifest.Checksum != info.Checksum {
 		return updateManifest{}, fmt.Errorf("update manifest does not match download metadata")
 	}
 	if len(manifest.Checksum) != 64 {
@@ -404,14 +434,25 @@ func (u *Updater) verifyReleaseArtifactManifest(payload []byte, info downloadInf
 		return updateManifest{}, fmt.Errorf("release artifact manifest version mismatch: expected %s, got %s", version, manifest.Release)
 	}
 
-	assetName, err := assetNameFromURL(info.URL)
-	if err != nil {
-		return updateManifest{}, fmt.Errorf("invalid release artifact download URL: %w", err)
+	// Asset name is derived from the agent's own platform/arch/component
+	// rather than parsed from info.URL — the URL may be a server-relative
+	// proxy (e.g. https://breeze.example.com/api/v1/agents/download/...)
+	// whose last segment is not the asset filename. The signed manifest's
+	// asset list still uses canonical names like "breeze-agent-windows-amd64.exe".
+	// Issue #646.
+	expected := u.expectedReleaseAssetNames()
+	if len(expected) == 0 {
+		return updateManifest{}, fmt.Errorf("no expected release asset names configured for component %q", u.component())
 	}
-	if expected := u.expectedReleaseAssetNames(); len(expected) > 0 {
-		if _, ok := expected[assetName]; !ok {
-			return updateManifest{}, fmt.Errorf("release artifact manifest asset mismatch: expected %v, got %s", expected, assetName)
-		}
+	if len(expected) != 1 {
+		// Defensive: expectedReleaseAssetNames always returns exactly one
+		// entry per (platform, arch, component) tuple. Surface this clearly
+		// if a future change adds ambiguity rather than silently picking one.
+		return updateManifest{}, fmt.Errorf("ambiguous expected asset names for component %q: %v", u.component(), expected)
+	}
+	var assetName string
+	for name := range expected {
+		assetName = name
 	}
 
 	var selected *releaseArtifactAsset
