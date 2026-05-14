@@ -47,12 +47,16 @@ function buildSelectChain<T>(rows: () => T[]) {
 let nextSelectRows: any[] = [];
 let nextUpdateReturning: any[] = [];
 let nextInsertReturning: any[] = [];
+let lastUpdateSet: Record<string, unknown> | undefined;
 
-vi.mock('../db', () => ({
-  db: {
+vi.mock('../db', () => {
+  const mockDb: any = {
     select: vi.fn(() => buildSelectChain(() => nextSelectRows)),
     update: vi.fn(() => ({
-      set: vi.fn(function (this: any) { return this; }),
+      set: vi.fn(function (this: any, payload: Record<string, unknown>) {
+        lastUpdateSet = payload;
+        return this;
+      }),
       where: vi.fn(function (this: any) { return this; }),
       returning: vi.fn(async () => nextUpdateReturning),
     })),
@@ -63,11 +67,20 @@ vi.mock('../db', () => ({
     delete: vi.fn(() => ({
       where: vi.fn(async () => undefined),
     })),
-    transaction: vi.fn(async (fn: any) => fn({})),
-  },
-  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
-  withDbAccessContext: vi.fn(async (_c: unknown, fn: () => Promise<unknown>) => fn()),
-  runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    // Pass mockDb itself as the tx so chained tx.update / tx.select reuse
+    // the same chain mocks as the bare db.
+    transaction: vi.fn(async (fn: any) => fn(mockDb)),
+  };
+  return {
+    db: mockDb,
+    withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    withDbAccessContext: vi.fn(async (_c: unknown, fn: () => Promise<unknown>) => fn()),
+    runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  };
+});
+
+vi.mock('../services/sentry', () => ({
+  captureException: vi.fn(),
 }));
 
 vi.mock('../db/schema', () => {
@@ -138,6 +151,7 @@ beforeEach(() => {
   nextSelectRows = [];
   nextUpdateReturning = [];
   nextInsertReturning = [];
+  lastUpdateSet = undefined;
   mockAuth = {
     scope: 'organization',
     partnerId: 'p-1',
@@ -233,6 +247,13 @@ describe('POST /me/mobile-devices/:id/block', () => {
     );
 
     expect(res.status).toBe(204);
+    // Push tokens MUST be cleared so a stolen phone can't keep receiving
+    // approval pushes after the block. (Issue #696 review finding.)
+    expect(lastUpdateSet).toMatchObject({
+      status: 'blocked',
+      fcmToken: null,
+      apnsToken: null,
+    });
   });
 
   it('refuses to block the current device with 409 + self_revoke_blocked', async () => {
@@ -426,5 +447,109 @@ describe('POST /admin/orgs/:orgId/oauth-clients/:clientId/unblock-globally', () 
     );
     // adminCanReachUser is not invoked; canAccessOrg uses 'o-1' so this org is out of scope
     expect([403, 404]).toContain(res.status);
+  });
+});
+
+// ============================================================
+// POST /me/oauth-clients/:clientId/revoke
+// ============================================================
+
+describe('POST /me/oauth-clients/:clientId/revoke (transactional revoke)', () => {
+  // The route looks up an existing grant first via .select().from().where().limit(),
+  // then calls revokeUserOauthClient which does:
+  //   - update grants .returning() — drives nextUpdateReturning
+  //   - select refresh tokens — drives nextSelectRows (second call)
+  //   - update refresh tokens (no returning, only matters for completion)
+  // Because the buildSelectChain mock returns nextSelectRows for every .from()
+  // chain, we drive both reads with the same array and order calls carefully.
+
+  it('returns 200 + cacheFailures + warning when Redis revokeJti throws', async () => {
+    const { revokeJti } = await import('../oauth/revocationCache');
+    vi.mocked(revokeJti).mockRejectedValueOnce(new Error('redis down'));
+
+    // First select: presence check returns one row so we proceed.
+    // Second select (inside transaction): refresh tokens to revoke.
+    // Drizzle's .limit() returns the array; we'll simulate with multiple
+    // select-chain invocations producing the same rows.
+    nextSelectRows = [{ id: 'grant-1', revokedAt: null }];
+    nextUpdateReturning = [{ id: 'grant-1' }];
+
+    // Patch the chain so the second .from() returns a refresh-token list
+    // and the first returns the grant presence row.
+    let selectCallCount = 0;
+    const { db } = await import('../db');
+    vi.mocked(db.select).mockImplementation(() => {
+      selectCallCount++;
+      return buildSelectChain<any>(() =>
+        selectCallCount === 1
+          ? [{ id: 'grant-1', revokedAt: null }]
+          : [
+              {
+                id: 'rt-1',
+                payload: { jti: 'jti-1', grantId: 'g-1' },
+                expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              },
+            ]
+      ) as any;
+    });
+
+    const res = await lifecycleRoutes.request('/me/oauth-clients/cid-1/revoke', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'test' }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.revoked).toBe(true);
+    expect(body.cacheFailures).toBeGreaterThanOrEqual(1);
+    expect(body.warning).toMatch(/cache/i);
+
+    const { captureException } = await import('../services/sentry');
+    expect(captureException).toHaveBeenCalled();
+  });
+
+  it('returns 204 with no body when revoke + cache writes all succeed', async () => {
+    nextSelectRows = [{ id: 'grant-1', revokedAt: null }];
+    nextUpdateReturning = [{ id: 'grant-1' }];
+
+    let selectCallCount = 0;
+    const { db } = await import('../db');
+    vi.mocked(db.select).mockImplementation(() => {
+      selectCallCount++;
+      return buildSelectChain<any>(() =>
+        selectCallCount === 1 ? [{ id: 'grant-1', revokedAt: null }] : []
+      ) as any;
+    });
+
+    const res = await lifecycleRoutes.request('/me/oauth-clients/cid-1/revoke', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'test' }),
+    });
+
+    expect(res.status).toBe(204);
+  });
+
+  it('returns 409 when no grants remain to revoke', async () => {
+    nextSelectRows = [{ id: 'grant-1', revokedAt: null }];
+    nextUpdateReturning = []; // already-revoked: update affects 0 rows
+
+    let selectCallCount = 0;
+    const { db } = await import('../db');
+    vi.mocked(db.select).mockImplementation(() => {
+      selectCallCount++;
+      return buildSelectChain<any>(() =>
+        selectCallCount === 1 ? [{ id: 'grant-1', revokedAt: null }] : []
+      ) as any;
+    });
+
+    const res = await lifecycleRoutes.request('/me/oauth-clients/cid-1/revoke', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'test' }),
+    });
+
+    expect(res.status).toBe(409);
   });
 });

@@ -5,15 +5,18 @@ import { and, eq, gt, desc } from 'drizzle-orm';
 
 import { db } from '../db';
 import { authMiddleware } from '../middleware/auth';
+import { mobileDeviceBlockedMiddleware } from '../middleware/mobileDeviceBlocked';
 import { approvalRequests } from '../db/schema/approvals';
 import { aiToolExecutions } from '../db/schema/ai';
-import { oauthGrants, oauthRefreshTokens } from '../db/schema/oauth';
 import { auditLogs } from '../db/schema/audit';
 import { buildApprovalPush, getUserPushTokens, sendExpoPush } from '../services/expoPush';
+import { revokeUserOauthClient } from '../services/oauthRevocation';
+import { captureException } from '../services/sentry';
 
 export const approvalRoutes = new Hono();
 
 approvalRoutes.use('*', authMiddleware);
+approvalRoutes.use('*', mobileDeviceBlockedMiddleware);
 
 approvalRoutes.get('/pending', async (c) => {
   const userId = c.get('auth').user.id;
@@ -181,47 +184,36 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
           .set({ status: 'rejected', approvedBy: userId, approvedAt: new Date() })
           .where(eq(aiToolExecutions.id, existing.executionId));
       } catch (err) {
+        captureException(err);
         console.error('[approvals] report-suspicious: failed to mirror to ai_tool_executions:', err);
       }
     }
   }
 
-  // Revoke the requesting OAuth client (grant + refresh tokens) for this user.
-  // TODO(lifecycle): a parallel agent is adding a `revoked_at` column on
-  // `oauth_grants` for soft-revoke + audit history. Until that lands we delete
-  // the grant row outright (oidc-provider treats a missing grant as revoked)
-  // and mark refresh tokens as revoked via the existing column.
+  // Revoke the requesting OAuth client (grant + refresh tokens) for this
+  // user via the shared revokeUserOauthClient helper — same code path the
+  // self-revoke and admin-block routes use. Soft-revokes via
+  // oauth_grants.revoked_at + jti/grant Redis cache writes.
   const requestingClientId = existing.requestingClientId;
   let grantsRevoked = 0;
   let refreshTokensRevoked = 0;
+  let cacheFailures = 0;
+  let revocationFailed = false;
   if (requestingClientId) {
     try {
-      const deleted = await db
-        .delete(oauthGrants)
-        .where(
-          and(
-            eq(oauthGrants.accountId, userId),
-            eq(oauthGrants.clientId, requestingClientId),
-          )
-        )
-        .returning({ id: oauthGrants.id });
-      grantsRevoked = deleted.length;
-
-      const tokenRes = await db
-        .update(oauthRefreshTokens)
-        .set({ revokedAt: new Date() })
-        .where(
-          and(
-            eq(oauthRefreshTokens.userId, userId),
-            eq(oauthRefreshTokens.clientId, requestingClientId),
-          )
-        )
-        .returning({ id: oauthRefreshTokens.id });
-      refreshTokensRevoked = tokenRes.length;
+      const r = await revokeUserOauthClient(
+        userId,
+        requestingClientId,
+        userId,
+        'reported as suspicious by user',
+      );
+      grantsRevoked = r.grantsRevoked;
+      refreshTokensRevoked = r.refreshTokensRevoked;
+      cacheFailures = r.cacheFailures;
     } catch (err) {
+      revocationFailed = true;
+      captureException(err);
       console.error('[approvals] report-suspicious: revocation failed:', err);
-      // Non-fatal: the approval row + audit log are still authoritative; the
-      // user can revoke from the connected-apps UI as a fallback.
     }
   }
 
@@ -244,11 +236,31 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
         priorStatus: existing.status,
         grantsRevoked,
         refreshTokensRevoked,
+        cacheFailures,
+        revocationFailed,
       },
-      result: 'success',
+      result: revocationFailed ? 'failure' : 'success',
     });
   } catch (err) {
+    captureException(err);
     console.error('[approvals] report-suspicious: audit insert failed:', err);
+  }
+
+  // Tell the mobile UI whether revocation actually succeeded so it can
+  // render "session revoked" vs "report recorded — revoke manually from
+  // connected-apps" accurately.
+  if (revocationFailed || cacheFailures > 0) {
+    return c.json(
+      {
+        reported: true,
+        revoked: !revocationFailed,
+        cacheFailures,
+        warning: revocationFailed
+          ? 'session revocation failed; revoke this app manually from connected-apps'
+          : 'session-cache invalidation partially failed; active tokens may survive up to access-token TTL',
+      },
+      200
+    );
   }
 
   return c.body(null, 204);
@@ -307,10 +319,12 @@ async function decideHandler(
         .set({ status: aiStatus, approvedBy: userId, approvedAt: new Date() })
         .where(eq(aiToolExecutions.id, updated.executionId));
     } catch (err) {
+      captureException(err);
       console.error('[approvals] Failed to mirror status to ai_tool_executions:', err);
       // Non-fatal: the approval_request row is the source of truth for the
       // mobile UI. The SDK poll will time out at the 5-min ceiling if the
       // mirror fails — better than failing the user-facing decide call.
+      // Captured to Sentry so a sustained mirror failure pages ops.
     }
   }
 
