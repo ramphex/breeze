@@ -64,17 +64,42 @@ const listSitesSchema = z.object({
   limit: z.string().optional()
 });
 
+// Intl.supportedValuesOf('timeZone') omits UTC, GMT, and the Etc/* zones, so
+// a Set-membership check against that list rejects 'UTC' (the default).
+// Constructing Intl.DateTimeFormat throws RangeError on unknown zones and
+// accepts everything Intl recognizes, including those omissions.
+function isValidIanaTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Stored as-is into a JSONB column; `.passthrough()` keeps unknown keys for
+// forward compatibility. Email format is policed when present so downstream
+// `mailto:` consumers don't render garbage; empty string is accepted because
+// the form sends `''` for an absent value.
+const siteContactSchema = z
+  .object({
+    name: z.string().optional(),
+    email: z.union([z.string().email(), z.literal('')]).optional(),
+    phone: z.string().optional(),
+  })
+  .passthrough();
+
 const siteBaseSchema = z.object({
   orgId: z.string().uuid(),
   name: z.string().min(1),
   address: z.any().optional(),
-  timezone: z.string().optional(),
-  contact: z.any().optional(),
+  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').optional(),
+  contact: siteContactSchema.optional(),
   settings: z.any().optional()
 });
 
 const createSiteSchema = siteBaseSchema.extend({
-  timezone: z.string().default('UTC')
+  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').default('UTC')
 });
 
 const updateSiteSchema = siteBaseSchema.partial().omit({ orgId: true });
