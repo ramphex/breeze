@@ -5,12 +5,14 @@ const loadEnv = async () => import('./env');
 const OAUTH_ENV_KEYS = [
   'MCP_OAUTH_ENABLED',
   'OAUTH_DCR_ENABLED',
+  'OAUTH_DCR_REQUIRE_IAT',
   'OAUTH_ISSUER',
   'OAUTH_RESOURCE_URL',
   'OAUTH_JWKS_PRIVATE_JWK',
   'OAUTH_JWKS_PUBLIC_JWK',
   'OAUTH_COOKIE_SECRET',
   'NODE_ENV',
+  'MFA_FORCE_FOR_PARTNER_ADMIN',
 ] as const;
 
 const clearOauthEnv = () => {
@@ -47,10 +49,13 @@ describe('config env', () => {
     expect(mod.MCP_OAUTH_ENABLED).toBe(false);
   });
 
-  it('defaults OAUTH_DCR_ENABLED to true outside production', async () => {
+  // Task 21 (May 2026): DCR now defaults OFF in every environment.
+  // Production deploys must explicitly set OAUTH_DCR_ENABLED=true AND
+  // OAUTH_DCR_REQUIRE_IAT=true (boot-refused otherwise — see validate.ts).
+  it('defaults OAUTH_DCR_ENABLED to false in development', async () => {
     process.env.NODE_ENV = 'development';
     const mod = await loadEnv();
-    expect(mod.OAUTH_DCR_ENABLED).toBe(true);
+    expect(mod.OAUTH_DCR_ENABLED).toBe(false);
   });
 
   it('defaults OAUTH_DCR_ENABLED to false in production', async () => {
@@ -59,11 +64,22 @@ describe('config env', () => {
     expect(mod.OAUTH_DCR_ENABLED).toBe(false);
   });
 
-  it('allows OAUTH_DCR_ENABLED to opt in explicitly in production', async () => {
+  it('allows OAUTH_DCR_ENABLED to opt in explicitly', async () => {
     process.env.NODE_ENV = 'production';
     process.env.OAUTH_DCR_ENABLED = 'true';
     const mod = await loadEnv();
     expect(mod.OAUTH_DCR_ENABLED).toBe(true);
+  });
+
+  it('defaults OAUTH_DCR_REQUIRE_IAT to false when unset', async () => {
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_REQUIRE_IAT).toBe(false);
+  });
+
+  it('allows OAUTH_DCR_REQUIRE_IAT to opt in explicitly', async () => {
+    process.env.OAUTH_DCR_REQUIRE_IAT = 'true';
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_REQUIRE_IAT).toBe(true);
   });
 
   it('defaults OAUTH_ISSUER and OAUTH_RESOURCE_URL to empty strings', async () => {
@@ -77,5 +93,26 @@ describe('config env', () => {
     process.env.OAUTH_RESOURCE_URL = 'https://resource.example/custom';
     const mod = await loadEnv();
     expect(mod.OAUTH_RESOURCE_URL).toBe('https://resource.example/custom');
+  });
+
+  // mfaForcePartnerAdmin is the kill-switch for the role-level MFA gate
+  // introduced in Task 8 of the launch-readiness sprint. Defaults ON so
+  // the secure-by-default posture holds, but ops can flip it OFF without
+  // a code change when an enrollment outage locks legitimate users out.
+  it('defaults mfaForcePartnerAdmin to true when unset', async () => {
+    const mod = await loadEnv();
+    expect(mod.mfaForcePartnerAdmin()).toBe(true);
+  });
+
+  it('returns false when MFA_FORCE_FOR_PARTNER_ADMIN is explicitly disabled', async () => {
+    process.env.MFA_FORCE_FOR_PARTNER_ADMIN = 'false';
+    const mod = await loadEnv();
+    expect(mod.mfaForcePartnerAdmin()).toBe(false);
+  });
+
+  it('returns true when MFA_FORCE_FOR_PARTNER_ADMIN is explicitly true', async () => {
+    process.env.MFA_FORCE_FOR_PARTNER_ADMIN = 'true';
+    const mod = await loadEnv();
+    expect(mod.mfaForcePartnerAdmin()).toBe(true);
   });
 });

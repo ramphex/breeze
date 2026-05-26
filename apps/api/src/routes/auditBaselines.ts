@@ -458,13 +458,21 @@ auditBaselineRoutes.get(
     }
 
     const [device] = await db
-      .select({ id: devices.id, orgId: devices.orgId, hostname: devices.hostname })
+      .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId, hostname: devices.hostname })
       .from(devices)
       .where(and(...conditions))
       .limit(1);
 
     if (!device) {
       return c.json({ error: 'Device not found' }, 404);
+    }
+
+    // Site-scope: partner-scope users may be restricted to a subset of sites
+    // within the org. When the request context has no permissions object
+    // (e.g. system-scope), the site restriction does not apply.
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    if (permissions && typeof device.siteId === 'string' && !canAccessSite(permissions, device.siteId)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
     }
 
     const rows = await db

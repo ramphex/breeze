@@ -39,28 +39,59 @@ export function _resetJwksCacheForTests() {
  * additively keep the original mcp:* scopes so future code paths can branch
  * on the OAuth vocabulary if needed.
  *
+ * Mapping (target state — in effect since 2026-05-15 per Task 24 / MCP MED-4):
  *   mcp:read    → ai:read       (tools/list, read-only tool calls)
  *   mcp:write   → ai:read, ai:write
  *   mcp:execute → ai:read, ai:write, ai:execute
  *
  * `ai:execute_admin` is intentionally NOT granted via OAuth — it gates the
  * most destructive operations and remains API-key-only by policy.
+ *
+ * Historical note: through 2026-05-15 we also expanded `mcp:write` to grant
+ * `ai:execute` so pre-split refresh tokens (issued before `mcp:execute`
+ * existed) didn't silently lose tool execution mid-lifetime. The 14-day
+ * refresh-token TTL means every pre-split token has now expired, so the
+ * legacy expansion was removed. Tokens that still present only `mcp:write`
+ * must re-consent to obtain `mcp:execute` for tool execution. We emit a
+ * one-time warn-log per client_id when this happens so operators can see
+ * who's still on a pre-split token.
  */
-function expandOAuthScopes(oauthScopes: string[]): string[] {
+const LEGACY_MCP_WRITE_WARNED_CLIENT_IDS = new Set<string>();
+
+function warnLegacyMcpWriteSeen(clientId: string | undefined): void {
+  const key = clientId ?? '<no-client-id>';
+  if (LEGACY_MCP_WRITE_WARNED_CLIENT_IDS.has(key)) return;
+  LEGACY_MCP_WRITE_WARNED_CLIENT_IDS.add(key);
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[oauth] mcp:write presented without mcp:execute — ai:execute denied (client_id=${key}). Re-consent required for tool execution.`,
+  );
+}
+
+function expandOAuthScopes(oauthScopes: string[], clientId?: string): string[] {
   const out = new Set<string>(oauthScopes);
+  let sawLegacyMcpWriteOnly = false;
   for (const s of oauthScopes) {
     if (s === 'mcp:read') {
       out.add('ai:read');
     } else if (s === 'mcp:write') {
       out.add('ai:read');
       out.add('ai:write');
+      if (!oauthScopes.includes('mcp:execute')) {
+        sawLegacyMcpWriteOnly = true;
+      }
     } else if (s === 'mcp:execute') {
       out.add('ai:read');
       out.add('ai:write');
       out.add('ai:execute');
     }
   }
+  if (sawLegacyMcpWriteOnly) warnLegacyMcpWriteSeen(clientId);
   return Array.from(out);
+}
+
+export function _resetLegacyMcpWriteWarningsForTests() {
+  LEGACY_MCP_WRITE_WARNED_CLIENT_IDS.clear();
 }
 
 /**
@@ -208,11 +239,22 @@ export async function bearerTokenAuthMiddleware(c: Context, next: Next) {
     throw new HTTPException(401, { message: 'token missing required claims' });
   }
   try {
-    await assertActiveTenantContext({
-      scope: payload.org_id ? 'organization' : 'partner',
-      partnerId: payload.partner_id,
-      orgId: payload.org_id ?? null,
-    });
+    // OAuth bearers run with `strictForOauth: true` — pending/suspended/churned
+    // partners are rejected here even though first-party session JWTs would
+    // admit `pending` (so partnerGuard can redirect them to billing). An OAuth
+    // grant for a pending partner should never have been issued (consent in
+    // oauthInteraction.ts blocks it), and a partner flipped to
+    // suspended/churned post-issuance must lose access at request time —
+    // belt-and-suspenders with the proactive revoke in
+    // /admin/partners/:id/suspend-for-abuse.
+    await assertActiveTenantContext(
+      {
+        scope: payload.org_id ? 'organization' : 'partner',
+        partnerId: payload.partner_id,
+        orgId: payload.org_id ?? null,
+      },
+      { strictForOauth: true },
+    );
   } catch (err) {
     if (err instanceof TenantInactiveError) {
       throw new HTTPException(401, { message: 'tenant inactive' });
@@ -221,7 +263,12 @@ export async function bearerTokenAuthMiddleware(c: Context, next: Next) {
   }
 
   const oauthScopes = (payload.scope ?? '').split(' ').filter(Boolean);
-  const effectiveScopes = expandOAuthScopes(oauthScopes);
+  const clientIdClaim = typeof (payload as { client_id?: unknown }).client_id === 'string'
+    ? (payload as { client_id?: string }).client_id
+    : typeof (payload as { azp?: unknown }).azp === 'string'
+      ? (payload as { azp?: string }).azp
+      : undefined;
+  const effectiveScopes = expandOAuthScopes(oauthScopes, clientIdClaim);
 
   (c.set as (key: 'apiKey', value: OAuthApiKeyContext) => void)('apiKey', {
     id: `oauth:${typeof payload.jti === 'string' ? payload.jti : 'no-jti'}`,

@@ -1,10 +1,12 @@
 import { Context, Next } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { createHash, timingSafeEqual } from 'crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../db';
 import { devices } from '../db/schema';
 import { getRedis, rateLimiter } from '../services';
+import { createAuditLogAsync } from '../services/auditService';
+import { getTrustedClientIp } from '../services/clientIp';
 
 export interface AgentAuthContext {
   deviceId: string;
@@ -26,6 +28,15 @@ declare module 'hono' {
 // 120 requests per 60-second window per agent
 const AGENT_RATE_LIMIT = 120;
 const AGENT_RATE_WINDOW_SECONDS = 60;
+// Task 19: per-(agent, source-IP) bucket. A stolen token used from a second
+// IP can no longer eat the legit agent's 120/min budget — it has its own
+// smaller 30/min ceiling, and the legit agent keeps its own.
+const AGENT_PER_IP_RATE_LIMIT = 30;
+const AGENT_PER_IP_RATE_WINDOW_SECONDS = 60;
+// Dedup TTL for `agent.source.ip.changed` audits: log a given (device, IP)
+// pair at most once per day so noisy mobile/roaming agents don't drown ops
+// in events.
+const AGENT_IP_CHANGE_AUDIT_DEDUP_SECONDS = 24 * 60 * 60;
 // Default per-org budget: 5x the per-agent budget — supports up to ~5 active
 // agents per org without rate-limiting. Configurable via env var.
 const DEFAULT_AGENT_ORG_RATE_LIMIT = 600;
@@ -145,6 +156,37 @@ export function isAgentTokenRotationDue(tokenIssuedAt: Date | null | undefined, 
 }
 
 /**
+ * Task 18: Persistently suspend an agent token. Called when the WS layer
+ * detects a cross-tenant probe pattern (token spraying foreign session IDs).
+ * Idempotent — only writes on the first call per device.
+ *
+ * Unsuspending requires manual operator action (clear the columns directly
+ * or via a future admin endpoint); the agent will retry forever and produce
+ * a loud reconnect-loop signal that surfaces the suspension to ops.
+ */
+export async function suspendAgentToken(deviceId: string, reason: string): Promise<void> {
+  try {
+    await withSystemDbAccessContext(async () => {
+      await db
+        .update(devices)
+        .set({
+          agentTokenSuspendedAt: new Date(),
+          agentTokenSuspendedReason: reason.slice(0, 100),
+        })
+        .where(and(eq(devices.id, deviceId), isNull(devices.agentTokenSuspendedAt)));
+    });
+  } catch (err) {
+    // Best-effort: the auth gate is the source of truth. A failed suspension
+    // write just means the next probe will try again.
+    console.error('[agentAuth] suspendAgentToken failed', {
+      deviceId,
+      reason,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * Middleware to authenticate agent requests via Bearer token.
  * Hashes the token and compares against the stored agentTokenHash.
  * Enforces per-agent rate limiting via Redis.
@@ -185,6 +227,9 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
         previousWatchdogTokenHash: devices.previousWatchdogTokenHash,
         previousWatchdogTokenExpiresAt: devices.previousWatchdogTokenExpiresAt,
         status: devices.status,
+        agentTokenSuspendedAt: devices.agentTokenSuspendedAt,
+        hostname: devices.hostname,
+        lastSeenIp: devices.lastSeenIp,
       })
       .from(devices)
       .where(eq(devices.agentId, agentId))
@@ -193,6 +238,13 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
   });
 
   if (!device) {
+    throw new HTTPException(401, { message: 'Invalid agent credentials' });
+  }
+
+  // Task 18: suspended tokens fail closed. We do NOT leak the suspension
+  // reason in the response — a compromised agent should see the same 401
+  // as a stale token.
+  if (device.agentTokenSuspendedAt) {
     throw new HTTPException(401, { message: 'Invalid agent credentials' });
   }
 
@@ -230,8 +282,82 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     throw new HTTPException(403, { message: 'Device is quarantined pending admin approval' });
   }
 
-  // Rate limiting per agent
   const redis = getRedis();
+
+  // Task 19: per-(agent, source-IP) rate limit. A stolen token used from a
+  // second IP can't drain the legit agent's per-agent quota — each IP gets
+  // its own 30/min bucket. Runs BEFORE the per-agent limit so a spraying
+  // attacker doesn't also charge the per-agent bucket on rejected requests.
+  const sourceIp = getTrustedClientIp(c);
+  if (sourceIp && sourceIp !== 'unknown') {
+    const perIpKey = `agent_rate_ip:${device.id}:${sourceIp}`;
+    const perIpCheck = await rateLimiter(
+      redis,
+      perIpKey,
+      AGENT_PER_IP_RATE_LIMIT,
+      AGENT_PER_IP_RATE_WINDOW_SECONDS,
+    );
+    if (!perIpCheck.allowed) {
+      c.header('Retry-After', String(Math.ceil((perIpCheck.resetAt.getTime() - Date.now()) / 1000)));
+      throw new HTTPException(429, { message: 'Agent per-source-IP rate limit exceeded' });
+    }
+
+    // Task 19: detect source-IP changes. The legit agent typically lives at
+    // one fairly stable IP, so a sudden change is a compromise signal worth
+    // a security audit. Dedup at one event / device / IP / 24h so noisy
+    // mobile or roaming agents don't drown the audit log.
+    if (device.lastSeenIp && device.lastSeenIp !== sourceIp) {
+      const dedupKey = `agent_ip_change:${device.id}:${sourceIp}`;
+      let shouldAudit = false;
+      try {
+        const result = await redis?.set(
+          dedupKey,
+          '1',
+          'EX',
+          AGENT_IP_CHANGE_AUDIT_DEDUP_SECONDS,
+          'NX',
+        );
+        shouldAudit = result === 'OK';
+      } catch (err) {
+        // Dedup-lookup failure: skip the audit rather than risk a flood.
+        // The next request from this IP will retry.
+        console.error('[agentAuth] ip-change dedup lookup failed:', err);
+      }
+
+      if (shouldAudit) {
+        void createAuditLogAsync({
+          orgId: device.orgId,
+          actorType: 'agent',
+          actorId: device.id,
+          action: 'agent.source.ip.changed',
+          resourceType: 'device',
+          resourceId: device.id,
+          resourceName: device.hostname ?? undefined,
+          details: { previousIp: device.lastSeenIp, newIp: sourceIp },
+          ipAddress: sourceIp,
+          result: 'success',
+        });
+      }
+    }
+
+    // Persist the new IP fire-and-forget so the request path is never
+    // blocked on a write. The next authenticated request will see the
+    // updated value. Note: we update even on the first request (when
+    // lastSeenIp is NULL) so the first IP-change comparison has something
+    // to compare to.
+    if (device.lastSeenIp !== sourceIp) {
+      void withSystemDbAccessContext(async () => {
+        await db
+          .update(devices)
+          .set({ lastSeenIp: sourceIp })
+          .where(eq(devices.id, device.id));
+      }).catch((err) => {
+        console.error('[agentAuth] last_seen_ip update failed:', err);
+      });
+    }
+  }
+
+  // Rate limiting per agent
   const rateKey = `agent_rate:${agentId}`;
   const rateCheck = await rateLimiter(redis, rateKey, AGENT_RATE_LIMIT, AGENT_RATE_WINDOW_SECONDS);
 

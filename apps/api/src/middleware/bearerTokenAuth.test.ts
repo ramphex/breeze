@@ -323,11 +323,68 @@ describe('bearerTokenAuthMiddleware', () => {
     await expectUnauthorized(createContext({ Authorization: `Bearer ${token}` }), 'tenant inactive');
   });
 
-  it('maps mcp:write to ai:read+ai:write only (mcp:execute is the separate scope for execute)', async () => {
-    // Post-split: mcp:write grants read+write only. Tools/list and read-only
-    // tool calls work; anything execute-shaped requires mcp:execute on the
-    // grant. (Legacy back-compat removed after 2026-05-15; live 14-day
-    // refresh tokens issued before the split have aged out.)
+  it('asserts tenant context in strictForOauth mode (Task 15 / MCP H-1)', async () => {
+    // Pin the contract: OAuth bearer auth MUST call assertActiveTenantContext
+    // with { strictForOauth: true } so partners in `pending`/`suspended`/
+    // `churned` status are rejected at request time — even though first-party
+    // session JWTs (auth.ts) admit `pending` so partnerGuard can redirect to
+    // billing. The lax behavior is correct for the dashboard cookie path but
+    // wrong for OAuth bearers; this guards against future refactors that
+    // accidentally drop the flag.
+    const token = await mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: null,
+      scope: 'mcp:read',
+      jti: 'strict-flag-partner-jti',
+    });
+    dbState.rows = [
+      [{ orgAccess: 'all', orgIds: null }],
+      [],
+    ];
+
+    await bearerTokenAuthMiddleware(createContext({ Authorization: `Bearer ${token}` }), vi.fn());
+
+    expect(assertActiveTenantContext).toHaveBeenCalledWith(
+      {
+        scope: 'partner',
+        partnerId,
+        orgId: null,
+      },
+      { strictForOauth: true },
+    );
+  });
+
+  it('rejects bearer when partner status is pending (strictForOauth mode)', async () => {
+    // Semantic test: a `pending` partner — which a first-party session JWT
+    // would admit — must be rejected when authenticating via OAuth bearer.
+    // The strict variant of the helper enforces this; here we simulate it
+    // by having the mocked helper reject as it would for any non-`active`
+    // status under `{ strictForOauth: true }`.
+    vi.mocked(assertActiveTenantContext).mockImplementation(async (_ctx, opts) => {
+      if (opts?.strictForOauth) {
+        throw new TenantInactiveError('Partner is not active');
+      }
+    });
+    const token = await mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: orgId,
+      jti: 'pending-partner-jti',
+    });
+
+    await expectUnauthorized(createContext({ Authorization: `Bearer ${token}` }), 'tenant inactive');
+  });
+
+  it('mcp:write no longer implicitly grants ai:execute (Task 24 / MCP MED-4 — legacy cutoff 2026-05-15 has passed)', async () => {
+    // Pre-2026-05-15 the bearer middleware expanded `mcp:write` to also
+    // include `ai:execute` so 14-day live refresh tokens issued before the
+    // scope split kept working without re-consent. That migration window has
+    // closed: any token still presenting only `mcp:write` must now be denied
+    // ai:execute and re-consent to obtain `mcp:execute` for tool execution.
+    const { _resetLegacyMcpWriteWarningsForTests } = await import('./bearerTokenAuth');
+    _resetLegacyMcpWriteWarningsForTests();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const token = await mintToken({
       sub: userId,
       partner_id: partnerId,
@@ -340,6 +397,8 @@ describe('bearerTokenAuthMiddleware', () => {
 
     await bearerTokenAuthMiddleware(c, next);
 
+    // ai:write is still granted (mcp:write → ai:read + ai:write).
+    // ai:execute is NOT granted — that now requires mcp:execute.
     expect(c.get('apiKey')).toEqual({
       id: 'oauth:org-token-jti',
       orgId,
@@ -362,6 +421,10 @@ describe('bearerTokenAuthMiddleware', () => {
       expect.any(Function)
     );
     expect(next).toHaveBeenCalledOnce();
+    // One-time deprecation warning is emitted per client_id so operators can
+    // see who still holds pre-split tokens. The grant itself is denied.
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it('maps mcp:execute to internal execute scope', async () => {

@@ -20,7 +20,14 @@ export function isHosted(): boolean {
 // the internal service-to-service base URL used by breezeBillingClient.ts.
 export const BILLING_URL = process.env.BILLING_URL ?? '';
 
-export const OAUTH_DCR_ENABLED = envFlag('OAUTH_DCR_ENABLED', process.env.NODE_ENV !== 'production');
+// DCR (Dynamic Client Registration) defaults OFF in all environments.
+// Production deployments must explicitly opt in by setting OAUTH_DCR_ENABLED=true,
+// AND must also set OAUTH_DCR_REQUIRE_IAT=true (boot-refused otherwise — see
+// config/validate.ts). The IAT (initial-access-token) requirement closes the
+// public-spam vector: without it, anyone on the internet can POST /oauth/reg
+// and create clients with deceptive client_name strings.
+export const OAUTH_DCR_ENABLED = envFlag('OAUTH_DCR_ENABLED', false);
+export const OAUTH_DCR_REQUIRE_IAT = envFlag('OAUTH_DCR_REQUIRE_IAT', false);
 export const OAUTH_ISSUER = process.env.OAUTH_ISSUER ?? '';
 export const OAUTH_RESOURCE_URL = process.env.OAUTH_RESOURCE_URL ?? '';
 // Optional override for the consent UI base. Defaults to '' (relative path)
@@ -32,3 +39,12 @@ export const OAUTH_CONSENT_URL_BASE = process.env.OAUTH_CONSENT_URL_BASE ?? '';
 export const OAUTH_JWKS_PRIVATE_JWK = process.env.OAUTH_JWKS_PRIVATE_JWK ?? '';
 export const OAUTH_JWKS_PUBLIC_JWK = process.env.OAUTH_JWKS_PUBLIC_JWK ?? '';
 export const OAUTH_COOKIE_SECRET = process.env.OAUTH_COOKIE_SECRET ?? '';
+
+// Kill-switch for the role-level MFA gate (Task 8 of the launch-readiness
+// sprint). Defaults ON so the secure-by-default posture holds; ops can
+// flip it OFF without a code change to relieve an enrollment outage that
+// locks legitimate partner-admins out. Read at call time so tests and
+// runtime overrides don't need module re-evaluation.
+export function mfaForcePartnerAdmin(): boolean {
+  return envFlag('MFA_FORCE_FOR_PARTNER_ADMIN', true);
+}

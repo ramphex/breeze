@@ -1,5 +1,6 @@
 import type { InheritableRemoteAccessSettings, RemoteAccessProvider } from '@breeze/shared';
 import { isAllowedLauncherScheme } from '@breeze/shared';
+import { decryptForColumn } from './secretCrypto';
 
 // Reasons we may decline to produce a launch URL. These are surfaced to the UI
 // so it can distinguish expected-empty from configuration error from a security
@@ -77,9 +78,17 @@ export function resolveRemoteAccessLaunch(
     return { launchUrl: null, providerId: provider.id, scheme: null, skipReason: 'empty_url_template' };
   }
 
+  // Decrypt the provider password before substitution. Provider passwords
+  // are originally written under partners.settings.remoteAccessProviders by
+  // the partner-settings update route, so the AAD binding (v3 ciphertext) is
+  // partners.settings — the column-level binding the registry walker uses.
+  // For pre-migration plaintext rows decryptForColumn is a no-op.
+  // See GitHub issue #716.
+  const rawPassword = provider.password ?? '';
+  const password = decryptForColumn('partners', 'settings', rawPassword) ?? rawPassword;
   const built = provider.urlTemplate
     .replaceAll('{id}', encodeURIComponent(idValue))
-    .replaceAll('{password}', encodeURIComponent(provider.password ?? ''));
+    .replaceAll('{password}', encodeURIComponent(password));
 
   // Belt-and-suspenders: re-check the scheme on the *substituted* URL. The
   // input validator at orgs.ts already rejects disallowed-scheme templates,

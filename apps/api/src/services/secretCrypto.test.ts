@@ -245,4 +245,161 @@ describe('secretCrypto', () => {
 
     expect(() => reencryptSecret('plaintext-secret')).toThrow('APP_ENCRYPTION_KEY_ID');
   });
+
+  describe('AAD binding (v3)', () => {
+    it('encrypts with v3 prefix when aad is provided', async () => {
+      const { encryptSecret, isEncryptedSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'webhooks.secret' });
+      expect(encrypted).toMatch(/^enc:v3:current:/);
+      expect(isEncryptedSecret(encrypted!)).toBe(true);
+    });
+
+    it('round-trips with matching aad', async () => {
+      const { encryptSecret, decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'webhooks.secret' });
+      expect(decryptSecret(encrypted, { aad: 'webhooks.secret' })).toBe('hello');
+    });
+
+    it('refuses to decrypt with a different aad', async () => {
+      const { encryptSecret, decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'sso_providers.client_secret' });
+      expect(() => decryptSecret(encrypted, { aad: 'webhooks.secret' })).toThrow();
+    });
+
+    it('refuses to decrypt v3 without aad', async () => {
+      const { encryptSecret, decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'webhooks.secret' });
+      expect(() => decryptSecret(encrypted)).toThrow();
+    });
+
+    it('continues to decrypt v2 (no aad) without breaking', async () => {
+      const { encryptSecret, decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const v2 = encryptSecret('hello');
+      expect(v2).toMatch(/^enc:v2:/);
+      expect(decryptSecret(v2)).toBe('hello');
+      // v2 also decrypts when callers pass aad (ignored for v2).
+      expect(decryptSecret(v2, { aad: 'whatever' })).toBe('hello');
+    });
+
+    it('encryptSecret without opts.aad still produces v2 even when key id is configured', async () => {
+      const { encryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello');
+      expect(encrypted).toMatch(/^enc:v2:current:/);
+    });
+
+    it('detects v3 prefix via isEncryptedSecret', async () => {
+      const { isEncryptedSecret } = await loadSecretCrypto();
+
+      expect(isEncryptedSecret('enc:v3:current:something')).toBe(true);
+    });
+
+    it('returns key id for v3 ciphertext', async () => {
+      const { encryptSecret, getEncryptedSecretKeyId } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'webhooks.secret' });
+      expect(getEncryptedSecretKeyId(encrypted!)).toBe('current');
+    });
+
+    it('does not double-encrypt v3 values', async () => {
+      const { encryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'webhooks.secret' });
+      expect(encryptSecret(encrypted, { aad: 'webhooks.secret' })).toBe(encrypted);
+    });
+
+    it('strict mode refuses to decrypt v2 ciphertext', async () => {
+      const { encryptSecret, decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      // v2 ciphertext (no aad on encrypt path)
+      const v2 = encryptSecret('hello');
+      expect(v2).toMatch(/^enc:v2:/);
+
+      // Without strict, v2 decrypts even when caller passes aad (AAD ignored).
+      expect(decryptSecret(v2, { aad: 'webhooks.secret' })).toBe('hello');
+
+      // With strict, v2 is refused — closes the downgrade-swap window for
+      // columns that have completed the v2→v3 rotation.
+      expect(() => decryptSecret(v2, { aad: 'webhooks.secret', strict: true })).toThrow(
+        /Strict v3 requested but ciphertext is v2/i,
+      );
+    });
+
+    it('strict mode does not affect v3 ciphertext', async () => {
+      const { encryptSecret, decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const v3 = encryptSecret('hello', { aad: 'webhooks.secret' });
+      expect(decryptSecret(v3, { aad: 'webhooks.secret', strict: true })).toBe('hello');
+    });
+
+    it('decryptForColumn binds AAD from table+column', async () => {
+      const { encryptSecret, decryptForColumn } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const v3 = encryptSecret('hello', { aad: 'partners.settings' });
+      expect(decryptForColumn('partners', 'settings', v3)).toBe('hello');
+
+      // A ciphertext bound to partners.settings cannot be decrypted under
+      // sites.settings — the cross-column swap defense.
+      expect(() => decryptForColumn('sites', 'settings', v3)).toThrow();
+    });
+
+    it('reencryptSecret preserves aad binding when decrypting v3', async () => {
+      const { encryptSecret, decryptSecret, reencryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      const encrypted = encryptSecret('hello', { aad: 'webhooks.secret' });
+      const rotated = reencryptSecret(encrypted, { aad: 'webhooks.secret' });
+      expect(rotated).toMatch(/^enc:v3:current:/);
+      expect(decryptSecret(rotated, { aad: 'webhooks.secret' })).toBe('hello');
+    });
+
+    it('throws on malformed v3 encrypted data', async () => {
+      const { decryptSecret } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+
+      expect(() => decryptSecret('enc:v3:bad-data', { aad: 'x' })).toThrow('Malformed encrypted secret');
+    });
+  });
 });

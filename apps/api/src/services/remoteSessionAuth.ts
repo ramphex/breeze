@@ -1,4 +1,4 @@
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { getRedis } from './redis';
 
 type SessionType = 'terminal' | 'desktop' | 'tunnel';
@@ -8,11 +8,23 @@ const DESKTOP_CONNECT_CODE_TTL_MS = 2 * 60 * 1000; // 2 minutes
 const VNC_CONNECT_CODE_TTL_MS = 60 * 1000; // 60 seconds
 const ACCESS_TOKEN_EXPIRY_SECONDS = 15 * 60; // Must match createAccessToken expiry
 
+// Short prefix of sha256(userAgent) stored with the ticket — gives us
+// approximate identity binding while tolerating browser-update churn far
+// better than exact-UA equality.
+const UA_HASH_LEN = 16;
+
 interface WsTicketRecord {
   sessionId: string;
   sessionType: SessionType;
   userId: string;
   expiresAt: number;
+  // Caller-binding metadata (Task 16). Stored at issue time so we can reject
+  // a 60-second ticket when consumed from a different network position.
+  // `ip` is the trusted client IP at issue time; `uaHash` is sha256(UA)[:16].
+  // Older records (pre-Task-16) may not have these fields; treated as bound
+  // only if present — see consumeWsTicket().
+  ip?: string;
+  uaHash?: string;
 }
 
 interface DesktopConnectCodeRecord {
@@ -74,6 +86,38 @@ function generateSecret(size: number): string {
   return randomBytes(size).toString('base64url');
 }
 
+function hashUa(ua: string): string {
+  return createHash('sha256').update(ua).digest('hex').slice(0, UA_HASH_LEN);
+}
+
+/**
+ * Whether ticket consumption must match the issuer's trusted client IP.
+ * Defaults to true. Set WS_TICKET_BIND_IP=false to relax IP-binding only
+ * (UA-hash binding stays on regardless).
+ *
+ * Why an env opt-out: behind a misbehaving corporate NAT the IP could
+ * change between the ticket-issue HTTPS request and the ticket-consume
+ * WS upgrade within the 60-second window. That's rare but a single
+ * customer environment with this problem would otherwise have no escape
+ * hatch.
+ */
+function shouldBindTicketIp(): boolean {
+  const explicit = (process.env.WS_TICKET_BIND_IP ?? '').trim().toLowerCase();
+  if (explicit === 'false' || explicit === '0' || explicit === 'no' || explicit === 'off') {
+    return false;
+  }
+  return true; // default: bind
+}
+
+/**
+ * Result of consuming a WS ticket. Distinct rejection reasons let the
+ * caller audit-log the cause; the ticket is burned on first mismatch so
+ * an adversary cannot probe.
+ */
+export type ConsumeWsTicketResult =
+  | { ok: true; sessionId: string; sessionType: SessionType; userId: string; expiresAt: number }
+  | { ok: false; reason: 'not_found' | 'expired' | 'ip_mismatch' | 'ua_mismatch' };
+
 function isExpired(expiresAt: number): boolean {
   return Date.now() >= expiresAt;
 }
@@ -127,12 +171,22 @@ export async function createWsTicket(input: {
   sessionId: string;
   sessionType: SessionType;
   userId: string;
+  /** Trusted client IP of the issuer (the user agent that just authenticated). */
+  ip?: string;
+  /** User-Agent of the issuer; stored as sha256(ua)[:16]. */
+  userAgent?: string;
 }): Promise<{ ticket: string; expiresInSeconds: number }> {
   purgeExpiredRecords(wsTickets);
   const ticket = generateSecret(32);
   const record: WsTicketRecord = {
-    ...input,
-    expiresAt: Date.now() + WS_TICKET_TTL_MS
+    sessionId: input.sessionId,
+    sessionType: input.sessionType,
+    userId: input.userId,
+    expiresAt: Date.now() + WS_TICKET_TTL_MS,
+    // Only persist caller binding when the issuer provided it. Callsites
+    // that pre-date Task 16 keep working but lose the IP/UA binding.
+    ...(input.ip ? { ip: input.ip } : {}),
+    ...(input.userAgent ? { uaHash: hashUa(input.userAgent) } : {}),
   };
 
   const ttlSeconds = Math.floor(WS_TICKET_TTL_MS / 1000);
@@ -154,15 +208,74 @@ export async function createWsTicket(input: {
   };
 }
 
-export async function consumeWsTicket(ticket: string): Promise<WsTicketRecord | null> {
+/**
+ * One-time consumption of a WS ticket. On any caller-binding mismatch the
+ * ticket is deleted (so an attacker cannot probe through different
+ * combinations within the 60-second TTL).
+ *
+ * Callers MUST pass the trusted client IP + UA from the WS upgrade
+ * request so binding can be checked. Omitting them is a server-side bug
+ * and treated as an immediate `ip_mismatch`/`ua_mismatch` rejection when
+ * the stored record has binding metadata.
+ */
+export async function consumeWsTicket(
+  ticket: string,
+  caller: { ip: string; userAgent: string }
+): Promise<ConsumeWsTicketResult> {
+  // Atomic GET+DEL — only one concurrent caller wins the record. The IP+UA
+  // checks then run against the (already-claimed) record. A previous
+  // version of this function split GET and DEL across an await boundary,
+  // which let two concurrent claims both succeed and silently violated the
+  // documented one-time semantics — fine for legit racers (e.g. React
+  // strict-mode double-fire) but not what the design promises.
+  let record: WsTicketRecord | null = null;
+
   if (shouldUseRedis()) {
-    const record = await redisConsumeJson<WsTicketRecord>(`${REDIS_KEY_PREFIX_WS_TICKET}${ticket}`);
-    if (!record) return null;
-    if (isExpired(record.expiresAt)) return null;
-    return record;
+    try {
+      record = await redisConsumeJson<WsTicketRecord>(`${REDIS_KEY_PREFIX_WS_TICKET}${ticket}`);
+    } catch (err) {
+      console.error('[session-auth] Failed to atomically consume WS ticket from Redis:', err);
+      return { ok: false, reason: 'not_found' };
+    }
+  } else {
+    // In-memory equivalent: get + delete synchronously before any await, so
+    // a second caller landing on the same tick sees nothing. We do NOT
+    // filter by expiry here so the outer code can return 'expired' rather
+    // than a less-informative 'not_found'.
+    record = wsTickets.get(ticket) ?? null;
+    if (record) {
+      wsTickets.delete(ticket);
+    }
   }
 
-  return consumeRecord(wsTickets, ticket);
+  if (!record) {
+    return { ok: false, reason: 'not_found' };
+  }
+
+  if (isExpired(record.expiresAt)) {
+    return { ok: false, reason: 'expired' };
+  }
+
+  // IP binding — only enforced if (a) the env flag is on (default) AND
+  // (b) the stored record actually carries an IP. The record is already
+  // gone (atomic DEL above), so a probe with corrected IP/UA after a
+  // mismatch hits "not_found".
+  if (shouldBindTicketIp() && record.ip && record.ip !== caller.ip) {
+    return { ok: false, reason: 'ip_mismatch' };
+  }
+
+  // UA binding — always enforced when the stored record carries a hash.
+  if (record.uaHash && record.uaHash !== hashUa(caller.userAgent)) {
+    return { ok: false, reason: 'ua_mismatch' };
+  }
+
+  return {
+    ok: true,
+    sessionId: record.sessionId,
+    sessionType: record.sessionType,
+    userId: record.userId,
+    expiresAt: record.expiresAt,
+  };
 }
 
 export async function createDesktopConnectCode(input: {

@@ -272,17 +272,64 @@ describe('validateConfig', () => {
     });
   });
 
-  it('does not require a release artifact manifest public key for local production binaries', () => {
+  // Task 27 / audit HIGH-2: previously the validator only required
+  // RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS when BINARY_SOURCE=github. A
+  // self-hosted deploy that switched to BINARY_SOURCE=local without the
+  // trust key would silently fall back to unsigned manifest acceptance —
+  // agents would then trust update manifests with no signature verification.
+  // The check now fires for BOTH github and local in production.
+  it('refuses BINARY_SOURCE=local without RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS in production', () => {
     withEnv({
       ...validEnv,
       NODE_ENV: 'production',
       BINARY_SOURCE: 'local',
       RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: '',
+      BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: '',
+      CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+      TRUST_PROXY_HEADERS: 'true',
+    }, () => {
+      expect(() => validateConfig()).toThrow(/RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS/i);
+    });
+  });
+
+  it('boots when BINARY_SOURCE=local AND the manifest pubkey is set in production', () => {
+    withEnv({
+      ...validEnv,
+      NODE_ENV: 'production',
+      BINARY_SOURCE: 'local',
+      RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: 'prod-test-release-manifest-public-key',
       CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
       TRUST_PROXY_HEADERS: 'true',
     }, () => {
       const config = validateConfig();
       expect(config.NODE_ENV).toBe('production');
+    });
+  });
+
+  it('accepts BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS as a fallback when BINARY_SOURCE=local', () => {
+    withEnv({
+      ...validEnv,
+      NODE_ENV: 'production',
+      BINARY_SOURCE: 'local',
+      RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: '',
+      BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: 'prod-test-release-manifest-public-key',
+      CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+      TRUST_PROXY_HEADERS: 'true',
+    }, () => {
+      const config = validateConfig();
+      expect(config.NODE_ENV).toBe('production');
+    });
+  });
+
+  it('does not require manifest pubkey for BINARY_SOURCE=local outside production', () => {
+    withEnv({
+      ...validEnv,
+      NODE_ENV: 'development',
+      BINARY_SOURCE: 'local',
+      RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: '',
+      BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: '',
+    }, () => {
+      expect(() => validateConfig()).not.toThrow();
     });
   });
 
@@ -353,8 +400,14 @@ describe('validateConfig', () => {
     });
   });
 
-  it('warns and defaults to loopback when TRUSTED_PROXY_CIDRS is empty in production (does not crash)', () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  // CRIT-1 / Task 25: when TRUST_PROXY_HEADERS=true in production, missing
+  // TRUSTED_PROXY_CIDRS used to fall back to loopback-only with a warning.
+  // That fallback means `isTrustedProxySource` rejects every upstream — the
+  // API then returns the socket IP (the proxy itself), so every request
+  // collapses to one fingerprint and per-IP rate limits stop functioning.
+  // Boot-refuse the misconfig so a single env-var typo can't enable
+  // unlimited credential stuffing against a self-hosted deploy.
+  it('refuses boot when TRUST_PROXY_HEADERS=true but TRUSTED_PROXY_CIDRS is empty in production', () => {
     withEnv({
       ...validEnv,
       NODE_ENV: 'production',
@@ -362,14 +415,8 @@ describe('validateConfig', () => {
       TRUST_PROXY_HEADERS: 'true',
       TRUSTED_PROXY_CIDRS: '',
     }, () => {
-      // Should NOT throw — operators upgrading without setting the new env var
-      // would otherwise crash on first boot. Runtime falls back to loopback-only.
-      expect(() => validateConfig()).not.toThrow();
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('TRUSTED_PROXY_CIDRS is empty')
-      );
+      expect(() => validateConfig()).toThrow(/TRUSTED_PROXY_CIDRS/i);
     });
-    warnSpy.mockRestore();
   });
 
   it('rejects broad private trusted proxy CIDRs in production', () => {
@@ -620,6 +667,442 @@ describe('validateConfig', () => {
         expect(err.message).toContain('CONFIGURATION VALIDATION FAILED');
         expect(err.message).toContain('Hint:');
       }
+    });
+  });
+
+  // ---- OAuth DCR (Dynamic Client Registration) hardening (Task 21) -------
+  // When DCR is on in production, every client registration is anonymous and
+  // self-asserting. Without an initial-access-token gate, the registration
+  // endpoint is open to public spam (deceptive client_name strings, etc.).
+  // Boot must refuse the misconfig.
+  describe('OAuth DCR config validation', () => {
+    it('refuses boot in production when OAUTH_DCR_ENABLED=true without OAUTH_DCR_REQUIRE_IAT=true', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        OAUTH_DCR_ENABLED: 'true',
+        OAUTH_DCR_REQUIRE_IAT: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/OAUTH_DCR_REQUIRE_IAT/i);
+      });
+    });
+
+    it('boots in production when OAUTH_DCR_ENABLED=true and OAUTH_DCR_REQUIRE_IAT=true', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        OAUTH_DCR_ENABLED: 'true',
+        OAUTH_DCR_REQUIRE_IAT: 'true',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('boots in production when OAUTH_DCR_ENABLED is unset (default false)', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        OAUTH_DCR_ENABLED: '',
+        OAUTH_DCR_REQUIRE_IAT: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('boots in production when OAUTH_DCR_ENABLED=false (IAT not required)', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        OAUTH_DCR_ENABLED: 'false',
+        OAUTH_DCR_REQUIRE_IAT: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('boots in development with OAUTH_DCR_ENABLED=true and no IAT (dev exception)', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'development',
+        OAUTH_DCR_ENABLED: 'true',
+        OAUTH_DCR_REQUIRE_IAT: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+  });
+
+  // ---- TRUST_PROXY_HEADERS / TRUSTED_PROXY_CIDRS hardening (CRIT-1, Task 25) ----
+  // When the API runs behind a reverse proxy in production, both
+  //   TRUST_PROXY_HEADERS=true AND a non-empty TRUSTED_PROXY_CIDRS
+  // are required. Without TRUSTED_PROXY_CIDRS, the proxy-trust path falls
+  // back to loopback-only — which means `isTrustedProxySource` rejects the
+  // real upstream proxy and `getTrustedClientIp` returns the proxy's own
+  // socket address for every request. Per-IP rate limits then collapse onto
+  // a single fingerprint and credential stuffing becomes unbounded.
+  describe('TRUST_PROXY_HEADERS validation', () => {
+    it('refuses to boot in production when TRUST_PROXY_HEADERS is missing', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/TRUST_PROXY_HEADERS/i);
+      });
+    });
+
+    it('refuses to boot when TRUST_PROXY_HEADERS=true but TRUSTED_PROXY_CIDRS is empty', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        TRUSTED_PROXY_CIDRS: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/TRUSTED_PROXY_CIDRS/i);
+      });
+    });
+
+    it('refuses to boot when TRUST_PROXY_HEADERS=true but TRUSTED_PROXY_CIDRS is whitespace-only', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        TRUSTED_PROXY_CIDRS: '   ',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/TRUSTED_PROXY_CIDRS/i);
+      });
+    });
+
+    it.each(['true', '1', 'yes', 'on'])(
+      'refuses to boot when TRUST_PROXY_HEADERS=%j but TRUSTED_PROXY_CIDRS is empty',
+      (truthy) => {
+        withEnv({
+          ...validEnv,
+          NODE_ENV: 'production',
+          CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+          TRUST_PROXY_HEADERS: truthy,
+          TRUSTED_PROXY_CIDRS: '',
+        }, () => {
+          expect(() => validateConfig()).toThrow(/TRUSTED_PROXY_CIDRS/i);
+        });
+      },
+    );
+
+    it('boots when both TRUST_PROXY_HEADERS=true and TRUSTED_PROXY_CIDRS are set in production', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'true',
+        TRUSTED_PROXY_CIDRS: '172.30.0.11/32',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('boots when TRUST_PROXY_HEADERS=false (proxy headers explicitly distrusted) regardless of CIDRs', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'false',
+        TRUSTED_PROXY_CIDRS: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('does not require TRUSTED_PROXY_CIDRS in development when TRUST_PROXY_HEADERS is unset', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'development',
+        TRUST_PROXY_HEADERS: '',
+        TRUSTED_PROXY_CIDRS: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('does not require TRUSTED_PROXY_CIDRS in development even when TRUST_PROXY_HEADERS=true', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'development',
+        TRUST_PROXY_HEADERS: 'true',
+        TRUSTED_PROXY_CIDRS: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Task 26 (audit H-3): feature-flagged secrets must be present in production.
+  //
+  // Several "boot-or-die" secrets are read directly at first feature use and
+  // silently 500 the request rather than failing at boot. The validator now
+  // enforces them in production whenever the corresponding feature flag (or
+  // soft-enable indicator — see below) is set.
+  //
+  // Important: this codebase does NOT use a uniform `<FEATURE>_ENABLED` flag
+  // pattern. The actual indicators are:
+  //   - Billing (breeze-billing service-to-service):     BREEZE_BILLING_URL set
+  //   - Billing (AI cost tracking via partner service):  BILLING_SERVICE_URL set
+  //   - OAuth (MCP DCR + JWT):                           MCP_OAUTH_ENABLED=true
+  //   - S3 / object storage:                             S3_BUCKET set
+  //   - Email (Resend):                                  EMAIL_PROVIDER=resend
+  //                                                       OR (auto + RESEND_API_KEY)
+  //   - Cloudflare mTLS:                                 CLOUDFLARE_API_TOKEN set
+  //   - MSI signing:                                     MSI_SIGNING_URL set
+  //
+  // Stripe is NOT present in apps/api (it lives in the separate breeze-billing
+  // service). The audit plan listed STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET
+  // speculatively; the API-side enforcement here covers BILLING_SERVICE_API_KEY
+  // and BREEZE_BILLING_URL's companion secrets instead.
+  describe('Feature-flagged production secrets (H-3)', () => {
+    const prodBase = {
+      ...validEnv,
+      NODE_ENV: 'production' as const,
+      CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+      TRUST_PROXY_HEADERS: 'true',
+    };
+
+    // --- OAuth (MCP_OAUTH_ENABLED) ------------------------------------------
+    it('refuses to boot when MCP_OAUTH_ENABLED=true but OAUTH_JWKS_PRIVATE_JWK is missing', () => {
+      withEnv({
+        ...prodBase,
+        MCP_OAUTH_ENABLED: 'true',
+        OAUTH_JWKS_PRIVATE_JWK: '',
+        OAUTH_COOKIE_SECRET: 'a-strong-random-cookie-secret-32-chars-min',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/OAUTH_JWKS_PRIVATE_JWK/);
+      });
+    });
+
+    it('refuses to boot when MCP_OAUTH_ENABLED=true but OAUTH_COOKIE_SECRET is missing', () => {
+      withEnv({
+        ...prodBase,
+        MCP_OAUTH_ENABLED: 'true',
+        OAUTH_JWKS_PRIVATE_JWK: '{"keys":[{"kty":"OKP"}]}',
+        OAUTH_COOKIE_SECRET: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/OAUTH_COOKIE_SECRET/);
+      });
+    });
+
+    it('does not require OAuth secrets when MCP_OAUTH_ENABLED is false', () => {
+      withEnv({
+        ...prodBase,
+        MCP_OAUTH_ENABLED: 'false',
+        OAUTH_JWKS_PRIVATE_JWK: '',
+        OAUTH_COOKIE_SECRET: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('boots when MCP_OAUTH_ENABLED=true and both OAuth secrets are set', () => {
+      withEnv({
+        ...prodBase,
+        MCP_OAUTH_ENABLED: 'true',
+        OAUTH_JWKS_PRIVATE_JWK: '{"keys":[{"kty":"OKP"}]}',
+        OAUTH_COOKIE_SECRET: 'a-strong-random-cookie-secret-32-chars-min',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    // --- Billing (BREEZE_BILLING_URL + BILLING_SERVICE_URL) -----------------
+    it('refuses to boot when BREEZE_BILLING_URL is set but BREEZE_BILLING_API_KEY is missing', () => {
+      withEnv({
+        ...prodBase,
+        BREEZE_BILLING_URL: 'https://billing.2breeze.app',
+        BREEZE_BILLING_API_KEY: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/BREEZE_BILLING_API_KEY/);
+      });
+    });
+
+    it('refuses to boot when BILLING_SERVICE_URL is set but BILLING_SERVICE_API_KEY is missing', () => {
+      withEnv({
+        ...prodBase,
+        BILLING_SERVICE_URL: 'https://billing.internal',
+        BILLING_SERVICE_API_KEY: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/BILLING_SERVICE_API_KEY/);
+      });
+    });
+
+    it('does not require billing secrets when billing URLs are unset', () => {
+      withEnv({
+        ...prodBase,
+        BREEZE_BILLING_URL: '',
+        BILLING_SERVICE_URL: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    // --- S3 / object storage (S3_BUCKET) ------------------------------------
+    it('refuses to boot when S3_BUCKET is set but S3_SECRET_KEY is missing', () => {
+      withEnv({
+        ...prodBase,
+        S3_BUCKET: 'breeze-binaries',
+        S3_ACCESS_KEY: 'AKIAEXAMPLE',
+        S3_SECRET_KEY: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/S3_SECRET_KEY/);
+      });
+    });
+
+    it('refuses to boot when S3_BUCKET is set but S3_ACCESS_KEY is missing', () => {
+      withEnv({
+        ...prodBase,
+        S3_BUCKET: 'breeze-binaries',
+        S3_ACCESS_KEY: '',
+        S3_SECRET_KEY: 'shhh',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/S3_ACCESS_KEY/);
+      });
+    });
+
+    it('does not require S3 credentials when S3_BUCKET is unset', () => {
+      withEnv({
+        ...prodBase,
+        S3_BUCKET: '',
+        S3_ACCESS_KEY: '',
+        S3_SECRET_KEY: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    // --- Email (EMAIL_PROVIDER=resend) --------------------------------------
+    it('refuses to boot when EMAIL_PROVIDER=resend but RESEND_API_KEY is missing', () => {
+      withEnv({
+        ...prodBase,
+        EMAIL_PROVIDER: 'resend',
+        RESEND_API_KEY: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/RESEND_API_KEY/);
+      });
+    });
+
+    it('refuses to boot when EMAIL_PROVIDER=smtp but SMTP_HOST is missing', () => {
+      withEnv({
+        ...prodBase,
+        EMAIL_PROVIDER: 'smtp',
+        SMTP_HOST: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/SMTP_HOST/);
+      });
+    });
+
+    it('refuses to boot when EMAIL_PROVIDER=mailgun but MAILGUN_API_KEY is missing', () => {
+      withEnv({
+        ...prodBase,
+        EMAIL_PROVIDER: 'mailgun',
+        MAILGUN_API_KEY: '',
+        MAILGUN_DOMAIN: 'mg.example.com',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/MAILGUN_API_KEY/);
+      });
+    });
+
+    it('does not require Resend key when EMAIL_PROVIDER is unset/auto', () => {
+      withEnv({
+        ...prodBase,
+        EMAIL_PROVIDER: '',
+        RESEND_API_KEY: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it('boots when EMAIL_PROVIDER=resend and RESEND_API_KEY is set', () => {
+      withEnv({
+        ...prodBase,
+        EMAIL_PROVIDER: 'resend',
+        RESEND_API_KEY: 're_test_strong_key_value',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    // --- Cloudflare (CLOUDFLARE_API_TOKEN set) ------------------------------
+    it('refuses to boot when CLOUDFLARE_API_TOKEN is set but CLOUDFLARE_ZONE_ID is missing', () => {
+      withEnv({
+        ...prodBase,
+        CLOUDFLARE_API_TOKEN: 'cf-token-xxx',
+        CLOUDFLARE_ZONE_ID: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/CLOUDFLARE_ZONE_ID/);
+      });
+    });
+
+    it('does not require Cloudflare zone id when token is unset', () => {
+      withEnv({
+        ...prodBase,
+        CLOUDFLARE_API_TOKEN: '',
+        CLOUDFLARE_ZONE_ID: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    // --- MSI signing (MSI_SIGNING_URL set) ----------------------------------
+    it('refuses to boot when MSI_SIGNING_URL is set but MSI_SIGNING_CF_ACCESS_SECRET is missing', () => {
+      withEnv({
+        ...prodBase,
+        MSI_SIGNING_URL: 'https://sign.2breeze.app/sign-breeze-agent',
+        MSI_SIGNING_CF_ACCESS_ID: 'cf-access-id',
+        MSI_SIGNING_CF_ACCESS_SECRET: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(/MSI_SIGNING_CF_ACCESS_SECRET/);
+      });
+    });
+
+    it('does not require MSI signing secrets when URL is unset', () => {
+      withEnv({
+        ...prodBase,
+        MSI_SIGNING_URL: '',
+        MSI_SIGNING_CF_ACCESS_SECRET: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    // --- Dev mode never enforces ----------------------------------------------
+    it('does not enforce feature-flagged secrets in development', () => {
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'development',
+        MCP_OAUTH_ENABLED: 'true',
+        OAUTH_JWKS_PRIVATE_JWK: '',
+        OAUTH_COOKIE_SECRET: '',
+        BREEZE_BILLING_URL: 'https://billing.internal',
+        BREEZE_BILLING_API_KEY: '',
+        S3_BUCKET: 'breeze',
+        S3_SECRET_KEY: '',
+        EMAIL_PROVIDER: 'resend',
+        RESEND_API_KEY: '',
+        CLOUDFLARE_API_TOKEN: 'cf',
+        CLOUDFLARE_ZONE_ID: '',
+        MSI_SIGNING_URL: 'https://sign',
+        MSI_SIGNING_CF_ACCESS_SECRET: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
     });
   });
 });

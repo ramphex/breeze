@@ -28,10 +28,10 @@ import {
   PROVIDER_PRESETS,
   type OIDCConfig
 } from '../services/sso';
-import { createTokenPair, createSession } from '../services';
+import { createTokenPair, createSession, mintRefreshTokenFamily, bindRefreshJtiToFamily } from '../services';
 import { writeRouteAudit } from '../services/auditEvents';
 import { getTrustedClientIp } from '../services/clientIp';
-import { decryptSecret, encryptSecret } from '../services/secretCrypto';
+import { decryptForColumn, encryptSecret } from '../services/secretCrypto';
 import { PERMISSIONS } from '../services/permissions';
 import { envFlag } from '../utils/envFlag';
 import { setRefreshTokenCookie } from './auth/helpers';
@@ -202,7 +202,7 @@ function buildSsoCallbackUri(): string {
 }
 
 function getOIDCConfig(provider: typeof ssoProviders.$inferSelect): OIDCConfig {
-  const decryptedClientSecret = decryptSecret(provider.clientSecret);
+  const decryptedClientSecret = decryptForColumn('sso_providers', 'client_secret', provider.clientSecret);
 
   if (!provider.clientId || !decryptedClientSecret || !provider.issuer) {
     throw new Error('Provider is not fully configured');
@@ -971,7 +971,16 @@ ssoRoutes.get('/callback', async (c) => {
       mfa: false
     };
 
-    const { accessToken, refreshToken, expiresInSeconds } = await createTokenPair(tokenPayload);
+    // Mint a fresh refresh-token family for the SSO-completed session so
+    // SSO logins get the same reuse-detection coverage as password/MFA
+    // logins. Without this, SSO-issued tokens would silently bypass RFC
+    // 9700 §4.13.2 protection.
+    const ssoFamilyId = await mintRefreshTokenFamily(user.id);
+    const { accessToken, refreshToken, refreshJti, expiresInSeconds } = await createTokenPair(
+      tokenPayload,
+      { refreshFam: ssoFamilyId }
+    );
+    await bindRefreshJtiToFamily(refreshJti, ssoFamilyId);
 
     await createSession({
       userId: user.id,

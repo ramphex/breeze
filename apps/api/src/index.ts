@@ -128,6 +128,8 @@ import { initializeLogCorrelationWorker, shutdownLogCorrelationWorker } from './
 import { initializeIPHistoryRetention, shutdownIPHistoryRetention } from './jobs/ipHistoryRetention';
 import { initializeChangeLogRetention, shutdownChangeLogRetention } from './jobs/changeLogRetention';
 import { initializeOauthCleanupWorker, shutdownOauthCleanupWorker } from './jobs/oauthCleanup';
+import { initializeAuditRetentionWorker, shutdownAuditRetentionWorker } from './jobs/auditRetention';
+import { initializeTenantErasureWorker, shutdownTenantErasureWorker } from './jobs/tenantErasure';
 import { initializeDiscoveryWorker, shutdownDiscoveryWorker } from './jobs/discoveryWorker';
 import { initializeNetworkBaselineWorker, shutdownNetworkBaselineWorker } from './jobs/networkBaselineWorker';
 import { initializeSnmpWorker, shutdownSnmpWorker } from './jobs/snmpWorker';
@@ -183,6 +185,7 @@ import { closeRedis, getRedis, isRedisAvailable } from './services/redis';
 import { shutdownEventDispatcher } from './services/eventDispatcher';
 import { getEventBus } from './services/eventBus';
 import { writeAuditEvent } from './services/auditEvents';
+import { drainAuditRetryQueue } from './services/auditService';
 import { createCorsOriginResolver } from './services/corsOrigins';
 import { validateConfig } from './config/validate';
 import { autoMigrate } from './db/autoMigrate';
@@ -838,6 +841,7 @@ export function getWorkerStatus(): Record<string, boolean> { return { ...workerS
 
 let server: ReturnType<typeof serve> | null = null;
 let shutdownInProgress = false;
+let auditRetryInterval: NodeJS.Timeout | null = null;
 
 function headersToRecord(headers: unknown): Record<string, string> {
   if (!headers) return {};
@@ -997,6 +1001,8 @@ async function initializeWorkers(): Promise<void> {
     ['reliabilityRetention', initializeReliabilityRetention],
     ['changeLogRetention', initializeChangeLogRetention],
     ['oauthCleanup', initializeOauthCleanupWorker],
+    ['auditRetention', initializeAuditRetentionWorker],
+    ['tenantErasure', initializeTenantErasureWorker],
     ['playbookRetention', initializePlaybookRetention],
     ['discoveryWorker', initializeDiscoveryWorker],
     ['networkBaselineWorker', initializeNetworkBaselineWorker],
@@ -1112,8 +1118,20 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
 
   stopTransferCleanup();
   getWebhookWorker().stop();
+  if (auditRetryInterval) {
+    clearInterval(auditRetryInterval);
+    auditRetryInterval = null;
+  }
 
   const shutdownTasks: Array<() => Promise<void>> = [
+    // Best-effort final drain of pending audit retries. Bounded by a hard
+    // 5s timeout so a stuck DB doesn't block the rest of shutdown.
+    async () => {
+      await Promise.race([
+        drainAuditRetryQueue().then(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+    },
     shutdownLogForwardingWorker,
     shutdownPatchJobWorkers,
     shutdownBackupWorker,
@@ -1148,6 +1166,8 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
     shutdownReliabilityRetention,
     shutdownChangeLogRetention,
     shutdownOauthCleanupWorker,
+    shutdownAuditRetentionWorker,
+    shutdownTenantErasureWorker,
     shutdownPlaybookRetention,
     shutdownSecurityPostureWorker,
     shutdownReliabilityWorker,
@@ -1331,6 +1351,20 @@ async function bootstrap(): Promise<void> {
 
   await initializeWorkers();
   initializeTransferCleanup();
+
+  // Periodically retry failed audit writes. The in-process queue is bounded
+  // (10k entries) and per-entry attempts are capped (3) with exponential
+  // backoff, so a long DB outage degrades to Sentry-capture rather than
+  // OOM. See `drainAuditRetryQueue` / `createAuditLogAsync` in
+  // `services/auditService.ts`.
+  auditRetryInterval = setInterval(() => {
+    void drainAuditRetryQueue().catch((err) => {
+      console.error('[audit-retry] drain failed:', err);
+    });
+  }, 30_000);
+  // Don't keep the event loop alive just for this timer.
+  auditRetryInterval.unref?.();
+
   installSignalHandlers();
 }
 

@@ -210,6 +210,28 @@ function isPrivateOrLocalProxyNetwork(ip: string): boolean {
   );
 }
 
+/**
+ * Task 26 (audit H-3) helper. Fires a Zod issue when a feature is "soft-enabled"
+ * (its flag/URL is present) but a required companion secret is missing or
+ * whitespace-only. Production-only enforcement; callers must gate on
+ * `NODE_ENV === 'production'`.
+ */
+function requireIf(
+  condition: boolean,
+  name: string,
+  value: string | undefined,
+  hint: string,
+  ctx: z.RefinementCtx,
+): void {
+  if (!condition) return;
+  if (value && value.trim()) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: [name],
+    message: `${name} is required in production when ${hint}. Without it the feature 5xxs at first use instead of failing at boot.`,
+  });
+}
+
 function validateTrustedProxyCidrsForProduction(value: string | undefined, ctx: z.RefinementCtx): void {
   const entries = (value ?? '')
     .split(',')
@@ -217,18 +239,31 @@ function validateTrustedProxyCidrsForProduction(value: string | undefined, ctx: 
     .filter(Boolean);
 
   if (entries.length === 0) {
-    // Don't fail startup. Operators upgrading from a release that didn't require
-    // this would otherwise crash on first boot behind their existing reverse proxy.
-    // Default to loopback-only (effectively: trust no upstream proxy) and warn.
-    // Real IP detection downstream falls back to the socket-level remote address,
-    // which is correct for direct connections and conservative for proxied ones.
-    if (process.env.NODE_ENV !== 'test') {
-      console.warn(
-        '[config] TRUST_PROXY_HEADERS=true but TRUSTED_PROXY_CIDRS is empty. ' +
-        'Defaulting to loopback only (127.0.0.1/32, ::1/128). ' +
-        'Set TRUSTED_PROXY_CIDRS to your reverse-proxy IPs to restore real-IP detection.'
-      );
-    }
+    // CRIT-1 / Task 25: boot-refuse instead of warn-and-default-to-loopback.
+    //
+    // Previous behavior was to fall back to loopback-only (127.0.0.1/32, ::1/128)
+    // when TRUST_PROXY_HEADERS=true but TRUSTED_PROXY_CIDRS was empty. In a
+    // real reverse-proxy deploy, the upstream proxy is never on loopback, so
+    // isTrustedProxySource() rejects every request and getTrustedClientIp()
+    // returns the proxy's own socket address for every connection. Per-IP
+    // rate limits then collapse onto a single fingerprint and the login
+    // rate-limit's secondary "UA + lang + XFF" fingerprint key — which the
+    // attacker fully controls — becomes the only barrier. That is
+    // exploitable for unlimited credential stuffing against any self-host
+    // deployment one env-var typo away from this state.
+    //
+    // Hosted droplets already set TRUSTED_PROXY_CIDRS correctly; this change
+    // closes the self-host footgun without affecting them. Operators who do
+    // NOT run behind a proxy should set TRUST_PROXY_HEADERS=false instead.
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['TRUSTED_PROXY_CIDRS'],
+      message:
+        'TRUSTED_PROXY_CIDRS must be a non-empty CIDR list when TRUST_PROXY_HEADERS is enabled in production '
+        + '(e.g. "172.30.0.11/32" for a local Caddy hop, or "10.0.0.0/8,172.16.0.0/12" for a wider trusted range). '
+        + 'Without it, every upstream proxy is rejected and per-IP rate limits collapse onto a spoofable fingerprint. '
+        + 'If the API is NOT behind a reverse proxy, set TRUST_PROXY_HEADERS=false instead.',
+    });
     return;
   }
 
@@ -315,6 +350,13 @@ const envSchema = z
       .string({ required_error: 'JWT_SECRET is required' })
       .min(1, 'JWT_SECRET must not be empty'),
 
+    // Optional: zero-downtime JWT signing key rotation via kid header.
+    // JSON map of kid → secret (each ≥32 chars). When set, JWT_ACTIVE_KID
+    // must select one of the kids to sign new tokens. JWT_SECRET is then
+    // retained as a verify-only fallback for legacy (no-kid) tokens.
+    JWT_SIGNING_KEYRING: z.string().optional(),
+    JWT_ACTIVE_KID: z.string().optional(),
+
     // -- E2E testing mode (must NEVER be enabled in production) ----------------
     E2E_MODE: z.string().optional(),
 
@@ -342,6 +384,54 @@ const envSchema = z
     BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: z.string().optional(),
     IS_HOSTED: z.string().optional(),
 
+    // OAuth Dynamic Client Registration (DCR) hardening. Both default OFF.
+    // See env.ts and provider.ts for the runtime read-paths; the
+    // production-only validation in superRefine refuses boot when
+    // OAUTH_DCR_ENABLED=true without OAUTH_DCR_REQUIRE_IAT=true.
+    OAUTH_DCR_ENABLED: z.string().optional(),
+    OAUTH_DCR_REQUIRE_IAT: z.string().optional(),
+
+    // -- Feature-flagged secrets (Task 26 / audit H-3) -----------------------
+    // The validator only enforces these in production when the corresponding
+    // soft-enable indicator (flag or "URL is set") is present. See the
+    // matching superRefine block below for the exact pairing. None of these
+    // are required at boot in development/test.
+    //
+    // OAuth (MCP) — required when MCP_OAUTH_ENABLED=true:
+    MCP_OAUTH_ENABLED: z.string().optional(),
+    OAUTH_JWKS_PRIVATE_JWK: z.string().optional(),
+    OAUTH_COOKIE_SECRET: z.string().optional(),
+
+    // Billing — required when corresponding URL is set (the URL is the
+    // "soft-enable" indicator; without a key, the call silently 5xxs at first
+    // request rather than at boot).
+    BREEZE_BILLING_URL: z.string().optional(),
+    BREEZE_BILLING_API_KEY: z.string().optional(),
+    BILLING_SERVICE_URL: z.string().optional(),
+    BILLING_SERVICE_API_KEY: z.string().optional(),
+
+    // S3 / object storage — required when S3_BUCKET is set.
+    S3_BUCKET: z.string().optional(),
+    S3_ACCESS_KEY: z.string().optional(),
+    S3_SECRET_KEY: z.string().optional(),
+
+    // Email — required when EMAIL_PROVIDER explicitly selects a backend.
+    EMAIL_PROVIDER: z.string().optional(),
+    RESEND_API_KEY: z.string().optional(),
+    SMTP_HOST: z.string().optional(),
+    MAILGUN_API_KEY: z.string().optional(),
+    MAILGUN_DOMAIN: z.string().optional(),
+
+    // Cloudflare mTLS — when CLOUDFLARE_API_TOKEN is set, zone id is required.
+    CLOUDFLARE_API_TOKEN: z.string().optional(),
+    CLOUDFLARE_ZONE_ID: z.string().optional(),
+
+    // MSI signing — when MSI_SIGNING_URL is set, CF Access secret is required
+    // (the signing tunnel rejects unauthenticated requests; without it every
+    // first installer-link request 5xxs).
+    MSI_SIGNING_URL: z.string().optional(),
+    MSI_SIGNING_CF_ACCESS_SECRET: z.string().optional(),
+
     // -- Optional with defaults -----------------------------------------------
     API_PORT: portSchema,
     REDIS_URL: z.string().default('redis://localhost:6379'),
@@ -364,6 +454,76 @@ const envSchema = z
   // --- Cross-field refinements (insecure defaults for required secrets) -------
   .superRefine((data, ctx) => {
     const isProduction = data.NODE_ENV === 'production';
+
+    // --- JWT signing keyring (zero-downtime rotation) ---
+    // Validated in every environment: a malformed keyring would break auth
+    // regardless of NODE_ENV, and a silent fallback to JWT_SECRET could mask
+    // a misconfigured production deploy.
+    if (data.JWT_SIGNING_KEYRING && data.JWT_SIGNING_KEYRING.trim()) {
+      let parsed: unknown;
+      let parseOk = false;
+      try {
+        parsed = JSON.parse(data.JWT_SIGNING_KEYRING);
+        parseOk = true;
+      } catch {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['JWT_SIGNING_KEYRING'],
+          message: 'JWT_SIGNING_KEYRING must be a JSON object of kid → secret.',
+        });
+      }
+
+      if (parseOk) {
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['JWT_SIGNING_KEYRING'],
+            message: 'JWT_SIGNING_KEYRING must be a JSON object of kid → secret.',
+          });
+        } else {
+          const entries = Object.entries(parsed as Record<string, unknown>);
+          if (entries.length === 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['JWT_SIGNING_KEYRING'],
+              message: 'JWT_SIGNING_KEYRING is empty. Either unset it or provide at least one kid.',
+            });
+          }
+          for (const [kid, secret] of entries) {
+            if (typeof secret !== 'string' || secret.length < 32) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['JWT_SIGNING_KEYRING'],
+                message: `JWT_SIGNING_KEYRING['${kid}'] must be a string of at least 32 characters.`,
+              });
+            }
+          }
+          if (!data.JWT_ACTIVE_KID && entries.length > 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['JWT_ACTIVE_KID'],
+              message: 'JWT_ACTIVE_KID must be set when JWT_SIGNING_KEYRING is configured.',
+            });
+          }
+          if (
+            data.JWT_ACTIVE_KID
+            && !(parsed as Record<string, unknown>)[data.JWT_ACTIVE_KID]
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['JWT_ACTIVE_KID'],
+              message: `JWT_ACTIVE_KID='${data.JWT_ACTIVE_KID}' is not present in JWT_SIGNING_KEYRING.`,
+            });
+          }
+        }
+      }
+    } else if (data.JWT_ACTIVE_KID) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['JWT_ACTIVE_KID'],
+        message: 'JWT_ACTIVE_KID is set but JWT_SIGNING_KEYRING is empty.',
+      });
+    }
 
     // MCP_LLM_PROVIDER openai-compatible: vLLM endpoint + auth + model id required at boot
     // (enforced in all environments, not just production)
@@ -482,13 +642,29 @@ const envSchema = z
       validateProductionPepper('ENROLLMENT_KEY_PEPPER', data.ENROLLMENT_KEY_PEPPER, ctx);
       validateProductionPepper('MFA_RECOVERY_CODE_PEPPER', data.MFA_RECOVERY_CODE_PEPPER, ctx);
 
-      const binarySource = (data.BINARY_SOURCE ?? 'github').trim().toLowerCase();
-      if (binarySource === 'github' && !hasReleaseArtifactManifestPublicKey(data)) {
+      // Task 27 (audit HIGH-2): require the manifest trust root in
+      // production for BOTH BINARY_SOURCE=github AND BINARY_SOURCE=local.
+      // - github mode: installer fallback assets are downloaded from the
+      //   GitHub release page; the manifest signature is the only thing
+      //   tying the asset bytes back to a release we built.
+      // - local mode: per-deployment manifests are signed by a key minted
+      //   into manifest_signing_keys (see services/manifestSigning.ts), but
+      //   agents only verify those signatures when a trust root has been
+      //   published to them via RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS. With
+      //   the env var unset, releaseArtifactManifest.ts has no keys to
+      //   verify against and the verification path silently falls back to
+      //   accepting unsigned manifests — defeating the whole agent-update
+      //   trust chain.
+      // The previous `binarySource === 'github'` gate was the bug: a
+      // self-host operator who switched to BINARY_SOURCE=local without
+      // also wiring RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS would boot clean
+      // and trust unsigned update manifests.
+      if (!hasReleaseArtifactManifestPublicKey(data)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS'],
           message:
-            'RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS must be set in production when BINARY_SOURCE=github so installer fallback assets are verified against the signed release manifest.',
+            'RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS must be set in production for both BINARY_SOURCE=github (verifies installer fallback assets against the signed release manifest) and BINARY_SOURCE=local (anchors per-deployment update manifests; without a trust root, agents accept unsigned manifests).',
         });
       }
 
@@ -593,6 +769,150 @@ const envSchema = z
             'IS_HOSTED must be explicitly set in production to true/false (or 1/0, yes/no, on/off). Hosted SaaS deployments set true; self-hosted deployments set false.',
         });
       }
+
+      // OAuth DCR (Dynamic Client Registration) hardening (Task 21).
+      // When DCR is enabled in production, an initial-access-token is also
+      // required — without it, POST /oauth/reg is anonymous and any actor
+      // on the internet can create OAuth clients with deceptive
+      // client_name strings (logos, brand mimicry, etc.). Boot-refuse the
+      // misconfig so a "DCR=true, IAT unset" deploy never reaches prod.
+      const dcrEnabledRaw = (data.OAUTH_DCR_ENABLED ?? '').trim().toLowerCase();
+      const dcrRequireIatRaw = (data.OAUTH_DCR_REQUIRE_IAT ?? '').trim().toLowerCase();
+      const dcrEnabled = ['true', '1', 'yes', 'on'].includes(dcrEnabledRaw);
+      const dcrRequireIat = ['true', '1', 'yes', 'on'].includes(dcrRequireIatRaw);
+      if (dcrEnabled && !dcrRequireIat) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['OAUTH_DCR_REQUIRE_IAT'],
+          message:
+            'OAUTH_DCR_REQUIRE_IAT=true is required when OAUTH_DCR_ENABLED=true in production. Without an initial-access-token gate, POST /oauth/reg is anonymous and any actor can create OAuth clients with deceptive client_name strings.',
+        });
+      }
+
+      // --- Task 26 / audit H-3: feature-flagged secrets -------------------
+      // Each soft-enabled feature must have its companion secret(s) present
+      // at boot. Without this, the API boots clean and 5xxs only on the
+      // first request that exercises the feature — which on a fresh prod
+      // deploy can be hours after Caddy's healthcheck passes.
+      //
+      // Indicator semantics:
+      //   - boolean flags  → MCP_OAUTH_ENABLED
+      //   - "URL is set"   → BREEZE_BILLING_URL, BILLING_SERVICE_URL,
+      //                      S3_BUCKET, CLOUDFLARE_API_TOKEN, MSI_SIGNING_URL
+      //   - explicit value → EMAIL_PROVIDER=resend|smtp|mailgun
+      const truthyFlag = (raw: string | undefined): boolean =>
+        ['true', '1', 'yes', 'on'].includes((raw ?? '').trim().toLowerCase());
+
+      // OAuth (MCP_OAUTH_ENABLED)
+      const mcpOauthEnabled = truthyFlag(data.MCP_OAUTH_ENABLED);
+      requireIf(
+        mcpOauthEnabled,
+        'OAUTH_JWKS_PRIVATE_JWK',
+        data.OAUTH_JWKS_PRIVATE_JWK,
+        'MCP_OAUTH_ENABLED=true (JWT signing material for /oauth/* endpoints)',
+        ctx,
+      );
+      requireIf(
+        mcpOauthEnabled,
+        'OAUTH_COOKIE_SECRET',
+        data.OAUTH_COOKIE_SECRET,
+        'MCP_OAUTH_ENABLED=true (oidc-provider session/interaction cookie signing)',
+        ctx,
+      );
+
+      // Billing (breeze-billing service-to-service)
+      const breezeBillingEnabled = Boolean(data.BREEZE_BILLING_URL?.trim());
+      requireIf(
+        breezeBillingEnabled,
+        'BREEZE_BILLING_API_KEY',
+        data.BREEZE_BILLING_API_KEY,
+        'BREEZE_BILLING_URL is set (service-to-service auth to breeze-billing)',
+        ctx,
+      );
+
+      // Billing (AI cost tracker — partner-credits API)
+      const partnerBillingEnabled = Boolean(data.BILLING_SERVICE_URL?.trim());
+      requireIf(
+        partnerBillingEnabled,
+        'BILLING_SERVICE_API_KEY',
+        data.BILLING_SERVICE_API_KEY,
+        'BILLING_SERVICE_URL is set (partner AI-credits check/deduct)',
+        ctx,
+      );
+
+      // S3 / object storage (S3_BUCKET as indicator)
+      const s3Enabled = Boolean(data.S3_BUCKET?.trim());
+      requireIf(
+        s3Enabled,
+        'S3_ACCESS_KEY',
+        data.S3_ACCESS_KEY,
+        'S3_BUCKET is set (object-storage uploads/presigned URLs)',
+        ctx,
+      );
+      requireIf(
+        s3Enabled,
+        'S3_SECRET_KEY',
+        data.S3_SECRET_KEY,
+        'S3_BUCKET is set (object-storage uploads/presigned URLs)',
+        ctx,
+      );
+
+      // Email — only enforced when EMAIL_PROVIDER explicitly picks a backend.
+      // 'auto' / unset leaves the system in best-effort mode (system.ts will
+      // mark email as `configured: false` and downstream code degrades).
+      const emailProvider = (data.EMAIL_PROVIDER ?? '').trim().toLowerCase();
+      requireIf(
+        emailProvider === 'resend',
+        'RESEND_API_KEY',
+        data.RESEND_API_KEY,
+        'EMAIL_PROVIDER=resend',
+        ctx,
+      );
+      requireIf(
+        emailProvider === 'smtp',
+        'SMTP_HOST',
+        data.SMTP_HOST,
+        'EMAIL_PROVIDER=smtp',
+        ctx,
+      );
+      requireIf(
+        emailProvider === 'mailgun',
+        'MAILGUN_API_KEY',
+        data.MAILGUN_API_KEY,
+        'EMAIL_PROVIDER=mailgun',
+        ctx,
+      );
+      requireIf(
+        emailProvider === 'mailgun',
+        'MAILGUN_DOMAIN',
+        data.MAILGUN_DOMAIN,
+        'EMAIL_PROVIDER=mailgun',
+        ctx,
+      );
+
+      // Cloudflare mTLS (CLOUDFLARE_API_TOKEN as indicator)
+      const cfMtlsEnabled = Boolean(data.CLOUDFLARE_API_TOKEN?.trim());
+      requireIf(
+        cfMtlsEnabled,
+        'CLOUDFLARE_ZONE_ID',
+        data.CLOUDFLARE_ZONE_ID,
+        'CLOUDFLARE_API_TOKEN is set (mTLS issuance against the configured zone)',
+        ctx,
+      );
+
+      // MSI signing (MSI_SIGNING_URL as indicator).
+      // The Cloudflare-fronted signing tunnel rejects unauthenticated requests.
+      // The signing service also accepts a per-account X-API-Key, but the
+      // CF Access service-token pair is mandatory in the current deploy —
+      // without it every /installer/link request 5xxs.
+      const msiSigningEnabled = Boolean(data.MSI_SIGNING_URL?.trim());
+      requireIf(
+        msiSigningEnabled,
+        'MSI_SIGNING_CF_ACCESS_SECRET',
+        data.MSI_SIGNING_CF_ACCESS_SECRET,
+        'MSI_SIGNING_URL is set (Cloudflare Access service-token auth to the signing tunnel)',
+        ctx,
+      );
     }
   });
 
@@ -696,6 +1016,8 @@ export function validateConfig(): AppConfig {
     DATABASE_URL_APP: env.DATABASE_URL_APP,
     BREEZE_APP_DB_PASSWORD: env.BREEZE_APP_DB_PASSWORD,
     JWT_SECRET: env.JWT_SECRET,
+    JWT_SIGNING_KEYRING: env.JWT_SIGNING_KEYRING,
+    JWT_ACTIVE_KID: env.JWT_ACTIVE_KID,
     APP_ENCRYPTION_KEY: env.APP_ENCRYPTION_KEY,
     MFA_ENCRYPTION_KEY: env.MFA_ENCRYPTION_KEY,
     CORS_ALLOWED_ORIGINS: env.CORS_ALLOWED_ORIGINS,
@@ -712,6 +1034,28 @@ export function validateConfig(): AppConfig {
     RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS,
     BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: env.BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS,
     IS_HOSTED: env.IS_HOSTED,
+    OAUTH_DCR_ENABLED: env.OAUTH_DCR_ENABLED,
+    OAUTH_DCR_REQUIRE_IAT: env.OAUTH_DCR_REQUIRE_IAT,
+    // Task 26 (H-3): feature-flagged production secrets.
+    MCP_OAUTH_ENABLED: env.MCP_OAUTH_ENABLED,
+    OAUTH_JWKS_PRIVATE_JWK: env.OAUTH_JWKS_PRIVATE_JWK,
+    OAUTH_COOKIE_SECRET: env.OAUTH_COOKIE_SECRET,
+    BREEZE_BILLING_URL: env.BREEZE_BILLING_URL,
+    BREEZE_BILLING_API_KEY: env.BREEZE_BILLING_API_KEY,
+    BILLING_SERVICE_URL: env.BILLING_SERVICE_URL,
+    BILLING_SERVICE_API_KEY: env.BILLING_SERVICE_API_KEY,
+    S3_BUCKET: env.S3_BUCKET,
+    S3_ACCESS_KEY: env.S3_ACCESS_KEY,
+    S3_SECRET_KEY: env.S3_SECRET_KEY,
+    EMAIL_PROVIDER: env.EMAIL_PROVIDER,
+    RESEND_API_KEY: env.RESEND_API_KEY,
+    SMTP_HOST: env.SMTP_HOST,
+    MAILGUN_API_KEY: env.MAILGUN_API_KEY,
+    MAILGUN_DOMAIN: env.MAILGUN_DOMAIN,
+    CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ZONE_ID: env.CLOUDFLARE_ZONE_ID,
+    MSI_SIGNING_URL: env.MSI_SIGNING_URL,
+    MSI_SIGNING_CF_ACCESS_SECRET: env.MSI_SIGNING_CF_ACCESS_SECRET,
     API_PORT: env.API_PORT,
     REDIS_URL: env.REDIS_URL,
     REDIS_HOST: env.REDIS_HOST,
