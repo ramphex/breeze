@@ -1,3 +1,6 @@
+mod ipc;
+
+use crate::ipc::token::HelperToken;
 use futures_util::StreamExt;
 use reqwest::{header::HeaderMap, Client, Identity, Method};
 use serde::{Deserialize, Serialize};
@@ -294,6 +297,14 @@ fn get_http_state_lock() -> &'static Mutex<Option<HttpClientState>> {
     HTTP_STATE.get_or_init(|| Mutex::new(None))
 }
 
+/// Process-global helper auth token delivered over IPC from the Breeze agent.
+/// Distinct from the file-loaded `HttpClientState::config.token` (Phase-1 fallback).
+static HELPER_TOKEN: OnceLock<HelperToken> = OnceLock::new();
+
+fn helper_token() -> &'static HelperToken {
+    HELPER_TOKEN.get_or_init(HelperToken::new)
+}
+
 /// Build a reqwest::Client, optionally with mTLS identity.
 fn build_client(cfg: &AgentConfigFull) -> Result<Client, String> {
     let mut builder = Client::builder().use_rustls_tls();
@@ -417,6 +428,15 @@ fn get_os_username() -> String {
 #[tauri::command]
 fn get_helper_config() -> HelperConfig {
     load_helper_config()
+}
+
+/// Report whether the helper auth token has been delivered over IPC yet.
+/// The frontend polls this on startup to show a transient "connecting to
+/// agent" state until the token arrives (relevant when there is no file
+/// fallback in Phase 2).
+#[tauri::command]
+async fn helper_token_ready() -> bool {
+    helper_token().get().await.is_some()
 }
 
 // -- helper_fetch types -----------------------------------------------------
@@ -565,7 +585,11 @@ async fn helper_fetch(
 ) -> Result<HelperFetchResponse, String> {
     ensure_http_state().await?;
 
-    let (client, token, api_url) = {
+    // Phase 1: prefer the IPC-delivered token; fall back to the file-loaded
+    // token while older agents still write it to agent.yaml. Phase 2 removes
+    // the file fallback.
+    let ipc_token = helper_token().get().await;
+    let (client, file_token, api_url) = {
         let lock = get_http_state_lock();
         let guard = lock.lock().await;
         let state = guard
@@ -577,6 +601,7 @@ async fn helper_fetch(
             state.config.api_url.clone(),
         )
     };
+    let token = ipc_token.unwrap_or(file_token);
 
     // Validate that the request URL targets the configured API server.
     // This prevents SSRF and token leakage to arbitrary hosts.
@@ -786,6 +811,7 @@ pub fn run() {
             get_os_username,
             get_helper_config,
             update_chat_active,
+            helper_token_ready,
         ])
         .setup(|app| {
             // Create main window manually (not from config) so we can set
@@ -966,6 +992,16 @@ pub fn run() {
                     write_status_file(CHAT_ACTIVE.load(Ordering::Relaxed));
                 }
             });
+
+            // Deliver the helper auth token over IPC from the Breeze agent.
+            // Keep the stop sender in managed state so the watch channel stays open
+            // for the app's lifetime; on app exit the state is dropped, the channel
+            // closes, and the client task exits. (The task also exits on a permanent
+            // broker reject — that is intentional.)
+            let token = helper_token().clone();
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            app.manage(stop_tx);
+            tauri::async_runtime::spawn(crate::ipc::client::run(token, stop_rx));
 
             Ok(())
         })

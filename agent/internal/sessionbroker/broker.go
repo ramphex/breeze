@@ -211,6 +211,9 @@ var (
 	systemHelperScopes   = []string{"notify", "tray", "clipboard", "desktop"}
 	userHelperScopes     = []string{"notify", "clipboard", "run_as_user"}
 	watchdogHelperScopes = []string{"watchdog"}
+	// assistHelperScopes is least-privilege: the Breeze Assist helper receives
+	// only the helper token and must NOT get desktop/clipboard/run_as_user/notify/tray.
+	assistHelperScopes = []string{ipc.ScopeAssist}
 )
 
 // MessageHandler is called when a user helper sends a message that isn't
@@ -219,6 +222,10 @@ type MessageHandler func(session *Session, env *ipc.Envelope)
 
 // SessionClosedHandler is called after a helper session has been removed.
 type SessionClosedHandler func(session *Session)
+
+// SessionAuthenticatedHandler is called after a helper session has been
+// successfully authenticated and registered.
+type SessionAuthenticatedHandler func(session *Session)
 
 // sessionSnapshot is an immutable point-in-time view of the broker's session
 // maps. It is stored via an atomic.Pointer so lock-free readers (FindCapableSession,
@@ -263,6 +270,7 @@ type Broker struct {
 
 	onMessage       MessageHandler
 	onSessionClosed SessionClosedHandler
+	onSessionAuthed SessionAuthenticatedHandler
 	selfHashes      map[string]struct{} // SHA-256 of allowed helper binaries
 }
 
@@ -332,6 +340,24 @@ func (b *Broker) SetSessionClosedHandler(handler SessionClosedHandler) {
 	b.mu.Lock()
 	b.onSessionClosed = handler
 	b.mu.Unlock()
+}
+
+// SetSessionAuthenticatedHandler registers a callback invoked (in a goroutine)
+// after each helper session has been authenticated and registered.
+func (b *Broker) SetSessionAuthenticatedHandler(handler SessionAuthenticatedHandler) {
+	b.mu.Lock()
+	b.onSessionAuthed = handler
+	b.mu.Unlock()
+}
+
+// fireSessionAuthenticated invokes the on-authenticated handler if set.
+func (b *Broker) fireSessionAuthenticated(session *Session) {
+	b.mu.RLock()
+	handler := b.onSessionAuthed
+	b.mu.RUnlock()
+	if handler != nil {
+		handler(session)
+	}
 }
 
 // SetConsoleUser updates the current macOS console user. When set to
@@ -1276,7 +1302,7 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 		helperRole = ipc.HelperRoleSystem
 	}
 	switch helperRole {
-	case ipc.HelperRoleSystem, ipc.HelperRoleUser, ipc.HelperRoleWatchdog, backupipc.HelperRoleBackup:
+	case ipc.HelperRoleSystem, ipc.HelperRoleUser, ipc.HelperRoleWatchdog, ipc.HelperRoleAssist, backupipc.HelperRoleBackup:
 	default:
 		log.Warn("unknown helper role", "role", helperRole, "identity", identityKey, "pid", creds.PID)
 		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
@@ -1289,90 +1315,26 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 	}
 
 	// Step 10: Validate role matches peer identity to prevent privilege escalation.
-	// On Windows, SYSTEM helpers must run as SYSTEM (S-1-5-18), and user helpers
-	// must NOT run as SYSTEM. This prevents a non-SYSTEM process from claiming
-	// system role to get desktop scopes, or SYSTEM from claiming user role.
-	// The watchdog must also run as root/SYSTEM.
-	const systemSID = "S-1-5-18"
-	if runtime.GOOS == "windows" {
-		if helperRole == ipc.HelperRoleSystem && creds.SID != systemSID {
-			log.Warn("role/identity mismatch: non-SYSTEM process claiming system role",
-				"sid", creds.SID, "pid", creds.PID)
-			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
-				Accepted:  false,
-				Reason:    "system role requires SYSTEM identity",
-				Permanent: true,
-			})
-			conn.Close()
-			return
-		}
-		if helperRole == ipc.HelperRoleUser && creds.SID == systemSID {
-			log.Warn("role/identity mismatch: SYSTEM process claiming user role",
-				"sid", creds.SID, "pid", creds.PID)
-			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
-				Accepted:  false,
-				Reason:    "user role requires non-SYSTEM identity",
-				Permanent: true,
-			})
-			conn.Close()
-			return
-		}
-		if helperRole == ipc.HelperRoleWatchdog && creds.SID != systemSID {
-			log.Warn("role/identity mismatch: non-SYSTEM process claiming watchdog role",
-				"sid", creds.SID, "pid", creds.PID)
-			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
-				Accepted:  false,
-				Reason:    "watchdog role requires SYSTEM identity",
-				Permanent: true,
-			})
-			conn.Close()
-			return
-		}
-	} else {
-		// Unix: watchdog and system-role helpers must run as root. The macOS
-		// desktop helper runs in the GUI user/loginwindow session, so it must
-		// authenticate as user-role and receives only desktop scope below.
-		if helperRole == ipc.HelperRoleWatchdog && creds.UID != 0 {
-			log.Warn("role/identity mismatch: non-root process claiming watchdog role",
-				"uid", creds.UID, "pid", creds.PID)
-			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
-				Accepted:  false,
-				Reason:    "watchdog role requires root identity",
-				Permanent: true,
-			})
-			conn.Close()
-			return
-		}
-		if helperRole == ipc.HelperRoleSystem && creds.UID != 0 {
-			log.Warn("role/identity mismatch: non-root process claiming system role",
-				"uid", creds.UID, "pid", creds.PID, "binaryKind", authReq.BinaryKind)
-			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
-				Accepted:  false,
-				Reason:    "system role requires root identity",
-				Permanent: true,
-			})
-			conn.Close()
-			return
-		}
+	// On Windows, SYSTEM helpers must run as SYSTEM (S-1-5-18), and user/assist
+	// helpers must NOT run as SYSTEM. This prevents a non-SYSTEM process from
+	// claiming system role to get desktop scopes, or SYSTEM from claiming user
+	// role. The watchdog must also run as root/SYSTEM. The decision is factored
+	// into roleIdentityRejection so the gate can be unit-tested with an injected
+	// peer-cred SID/UID (a real peer-cred SID can't be faked over a pipe).
+	if reason, rejected := roleIdentityRejection(helperRole, creds.SID, creds.UID, runtime.GOOS); rejected {
+		log.Warn("role/identity mismatch",
+			"reason", reason, "role", helperRole, "sid", creds.SID, "uid", creds.UID,
+			"pid", creds.PID, "binaryKind", authReq.BinaryKind)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    reason,
+			Permanent: true,
+		})
+		conn.Close()
+		return
 	}
 
-	var scopes []string
-	switch helperRole {
-	case ipc.HelperRoleUser:
-		if runtime.GOOS == "darwin" &&
-			authReq.BinaryKind == ipc.HelperBinaryDesktopHelper &&
-			b.isDesktopHelperPeerPath(creds.BinaryPath) {
-			scopes = []string{"desktop"}
-		} else {
-			scopes = userHelperScopes
-		}
-	case backupipc.HelperRoleBackup:
-		scopes = backupHelperScopes
-	case ipc.HelperRoleWatchdog:
-		scopes = watchdogHelperScopes
-	case ipc.HelperRoleSystem:
-		scopes = systemHelperScopes
-	}
+	scopes := b.scopesForRole(helperRole, authReq.BinaryKind, runtime.GOOS, creds.BinaryPath)
 
 	// Send auth response
 	authResp := ipc.AuthResponse{
@@ -1469,6 +1431,12 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 		"binaryKind", session.BinaryKind,
 		"desktopContext", session.DesktopContext,
 	)
+
+	// Notify the on-authenticated handler now that the session is fully
+	// registered (admitted, appended, scopes assigned). Fired outside the
+	// broker mutex and in a goroutine so a slow handler (e.g. one that pushes
+	// the helper token over IPC) can't block the accept loop or hold b.mu.
+	go b.fireSessionAuthenticated(session)
 
 	// Keepalive: send periodic pings and close the session if pongs stop
 	// arriving. Without this, a wedged helper (e.g. a capture process killed
@@ -1620,6 +1588,68 @@ func binaryPathMatchesAllowed(peerPath string, allowed []string) bool {
 	return false
 }
 
+// scopesForRole maps a validated helper role to its allowed scopes.
+// systemSID is the well-known Windows Local System account SID.
+const systemSID = "S-1-5-18"
+
+// roleIdentityRejection reports whether a helper claiming helperRole from the
+// given kernel-verified peer identity (SID on Windows, UID on Unix) must be
+// rejected, and the rejection reason. All role/identity mismatches are
+// permanent. It returns ("", false) when the role/identity pairing is allowed.
+//
+// Pure and OS-parameterized so the privilege-escalation gate can be unit-tested
+// with an injected SID/UID — a real peer-cred SID can't be forged over a named
+// pipe / Unix socket, so end-to-end pipe tests can only exercise the current
+// test process's own identity.
+func roleIdentityRejection(role, sid string, uid uint32, goos string) (reason string, rejected bool) {
+	if goos == "windows" {
+		switch {
+		case role == ipc.HelperRoleSystem && sid != systemSID:
+			return "system role requires SYSTEM identity", true
+		case role == ipc.HelperRoleUser && sid == systemSID:
+			return "user role requires non-SYSTEM identity", true
+		case role == ipc.HelperRoleAssist && sid == systemSID:
+			return "assist role requires non-SYSTEM identity", true
+		case role == ipc.HelperRoleWatchdog && sid != systemSID:
+			return "watchdog role requires SYSTEM identity", true
+		}
+		return "", false
+	}
+	// Unix: watchdog and system-role helpers must run as root. The macOS
+	// desktop helper runs in the GUI user/loginwindow session, so it must
+	// authenticate as user-role and receives only desktop scope. The assist
+	// helper is Windows-only; on Unix it would receive only the inert "assist"
+	// scope, so no identity gate is required here.
+	switch {
+	case role == ipc.HelperRoleWatchdog && uid != 0:
+		return "watchdog role requires root identity", true
+	case role == ipc.HelperRoleSystem && uid != 0:
+		return "system role requires root identity", true
+	}
+	return "", false
+}
+
+func (b *Broker) scopesForRole(role, binaryKind, goos, peerPath string) []string {
+	switch role {
+	case ipc.HelperRoleUser:
+		if goos == "darwin" &&
+			binaryKind == ipc.HelperBinaryDesktopHelper &&
+			b.isDesktopHelperPeerPath(peerPath) {
+			return []string{"desktop"}
+		}
+		return userHelperScopes
+	case backupipc.HelperRoleBackup:
+		return backupHelperScopes
+	case ipc.HelperRoleWatchdog:
+		return watchdogHelperScopes
+	case ipc.HelperRoleAssist:
+		return assistHelperScopes
+	case ipc.HelperRoleSystem:
+		return systemHelperScopes
+	}
+	return nil
+}
+
 func (b *Broker) isDesktopHelperPeerPath(peerPath string) bool {
 	peerResolved, err := filepath.EvalSymlinks(peerPath)
 	if err != nil {
@@ -1677,6 +1707,8 @@ func (b *Broker) allowedHelperPaths() []string {
 			"/usr/local/bin/breeze-watchdog",
 		)
 	}
+	// Allowlist the Breeze Assist helper binary so it can connect over IPC.
+	paths = append(paths, assistHelperBinaryPaths(dir)...)
 	seen := make(map[string]struct{}, len(paths))
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
@@ -1691,6 +1723,25 @@ func (b *Broker) allowedHelperPaths() []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+// assistHelperBinaryPaths returns candidate install paths for the Breeze Assist
+// helper, derived from the agent install dir. Used so RefreshAllowedHashes
+// allowlists the genuine breeze-helper binary's SHA-256. Non-existent paths are
+// skipped silently by computeAllowedHashes, so listing all platform candidates
+// is safe even when the helper is not installed.
+func assistHelperBinaryPaths(agentDir string) []string {
+	switch runtime.GOOS {
+	case "windows":
+		return []string{filepath.Join(agentDir, "breeze-helper.exe")}
+	case "darwin":
+		return []string{
+			"/Applications/Breeze Helper.app/Contents/MacOS/breeze-helper",
+			filepath.Join(agentDir, "breeze-helper"),
+		}
+	default:
+		return []string{filepath.Join(agentDir, "breeze-helper")}
+	}
 }
 
 // RefreshAllowedHashes recomputes the helper binary hash allowlist from the

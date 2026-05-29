@@ -53,6 +53,7 @@ const (
 	TypeWatchdogPong          = "watchdog_pong"
 	TypeShutdownIntent        = "shutdown_intent"
 	TypeTokenUpdate           = "token_update"
+	TypeHelperTokenUpdate     = "helper_token_update" // sent to the Assist helper
 	TypeWatchdogCommand       = "watchdog_command"
 	TypeWatchdogCommandResult = "watchdog_command_result"
 	TypeStateSync             = "state_sync"
@@ -107,17 +108,23 @@ type Envelope struct {
 	HMAC    string          `json:"hmac"`
 }
 
-// Helper role constants distinguish SYSTEM helpers (desktop capture) from
-// user-token helpers (script execution as the logged-in user).
+// Helper role constants identify connecting helper processes and gate their scopes.
 const (
 	HelperRoleSystem   = "system"
 	HelperRoleUser     = "user"
 	HelperRoleWatchdog = "watchdog"
+	HelperRoleAssist   = "assist" // Breeze Assist Tauri helper; receives helper token only
+)
+
+// Scope constants identify the capabilities granted to a helper session.
+const (
+	ScopeAssist = "assist" // IPC scope granted to the assist helper
 )
 
 const (
 	HelperBinaryUserHelper    = "user_helper"
 	HelperBinaryDesktopHelper = "desktop_helper"
+	HelperBinaryAssistHelper  = "assist_helper"
 )
 
 const (
@@ -142,8 +149,8 @@ type AuthRequest struct {
 	PID             int    `json:"pid"`
 	BinaryHash      string `json:"binaryHash"`
 	WinSessionID    uint32 `json:"winSessionId,omitempty"` // Windows session ID (1, 2, etc.)
-	HelperRole      string `json:"helperRole,omitempty"`   // "system" or "user" (default: "system")
-	BinaryKind      string `json:"binaryKind,omitempty"`   // "user_helper" or "desktop_helper"
+	HelperRole      string `json:"helperRole,omitempty"`   // "system" | "user" | "watchdog" | "assist" (default: "system")
+	BinaryKind      string `json:"binaryKind,omitempty"`   // "user_helper", "desktop_helper", or "assist_helper"
 	DesktopContext  string `json:"desktopContext,omitempty"`
 }
 
@@ -325,6 +332,14 @@ type ShutdownIntent struct {
 // TokenUpdate is sent by the agent to the watchdog when the watchdog-scoped token changes.
 type TokenUpdate struct {
 	Token string `json:"token"`
+}
+
+// HelperTokenUpdate carries the helper-scoped API token to the Assist helper.
+// Distinct from TokenUpdate (agent token -> watchdog) so the two tokens can
+// never be cross-delivered.
+type HelperTokenUpdate struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expiresAt,omitempty"` // RFC3339, optional
 }
 
 // WatchdogCommand is a command forwarded from the watchdog to the agent.
