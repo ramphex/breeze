@@ -160,6 +160,7 @@ import {
   createAgentWsRoutes,
   validateAgentToken,
   __resetCrossTenantDropsForTest,
+  AGENT_WS_CAPABILITIES,
 } from './agentWs';
 import { isAgentTenantActive } from '../services/tenantStatus';
 import { enqueueDiscoveryResults } from '../jobs/discoveryWorker';
@@ -267,6 +268,58 @@ function updateResult(rows: unknown[] = []) {
     })
   };
 }
+
+describe('agent websocket handshake', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('advertises terminal_output_base64 in the connected message', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123' };
+
+    vi.mocked(db.update).mockReturnValue(updateResult() as any);
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([]) as any);
+
+    const handlers = createAgentWsHandlers('agent-123', preValidatedAgent);
+    const ws = wsMock();
+
+    await handlers.onOpen({}, ws as any);
+
+    expect(ws.send).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(vi.mocked(ws.send).mock.calls[0][0] as string);
+    expect(payload.type).toBe('connected');
+    expect(payload.capabilities).toEqual([...AGENT_WS_CAPABILITIES]);
+  });
+
+  it('decodes base64 terminal_output and relays UTF-8 to the terminal consumer', async () => {
+    const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123' };
+
+    vi.mocked(getActiveTerminalSession).mockReturnValue({
+      agentId: 'agent-123',
+      userId: 'user-1',
+      deviceId: 'device-123',
+      startedAt: new Date(),
+      lastPongAt: Date.now(),
+      userWs: wsMock() as any,
+    } as any);
+
+    const handlers = createAgentWsHandlers('agent-123', preValidatedAgent);
+    const ws = wsMock();
+    const base64Payload = Buffer.from('café\n', 'utf8').toString('base64');
+
+    await handlers.onMessage({
+      data: JSON.stringify({
+        type: 'terminal_output',
+        sessionId,
+        data: base64Payload,
+        encoding: 'base64',
+      }),
+    } as any, ws as any);
+
+    expect(vi.mocked(handleTerminalOutput)).toHaveBeenCalledWith(sessionId, 'café\n');
+  });
+});
 
 describe('agent websocket command results', () => {
   beforeEach(() => {
