@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"image"
 	"regexp"
-	"time"
 
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/remote/desktop"
@@ -50,18 +49,11 @@ func (h *helperDesktopManager) startSession(req *ipc.DesktopStartRequest) (*ipc.
 		h.mgr.SetGPUVendor(req.GPUVendor)
 	}
 
-	// Build the agent-enforced policy from the IPC request. Absent clipboard
-	// fields (older service) default to permissive to preserve behavior.
-	policy := desktop.SessionPolicy{
-		ClipboardHostToViewer: req.ClipboardHostToViewer == nil || *req.ClipboardHostToViewer,
-		ClipboardViewerToHost: req.ClipboardViewerToHost == nil || *req.ClipboardViewerToHost,
-	}
-	if req.IdleTimeoutMinutes > 0 {
-		policy.IdleTimeout = time.Duration(req.IdleTimeoutMinutes) * time.Minute
-	}
-	if req.MaxSessionDurationHours > 0 {
-		policy.MaxDuration = time.Duration(req.MaxSessionDurationHours) * time.Hour
-	}
+	// Build the agent-enforced policy via the single centralized decoder so the
+	// nil→permissive clipboard logic and the <=0→unset timeout logic live in
+	// exactly one place (shared with the map-payload decoder). Bounds were
+	// already enforced upstream by validateDesktopStartRequest (client.go).
+	policy := desktop.ResolveSessionPolicyFromIPC(*req)
 
 	answer, err := h.mgr.StartSession(req.SessionID, req.Offer, iceServers, req.DisplayIndex, policy)
 	if err != nil {

@@ -143,27 +143,27 @@ func (m *SessionManager) StartSession(sessionID string, offer string, iceServers
 					return
 				case <-ticker.C:
 					now := time.Now()
-					if policy.MaxDuration > 0 && now.Sub(startWall) >= policy.MaxDuration {
+					// Idle is driven by lastInputUnixNano (viewer INPUT only) — see
+					// shouldStopForLifetime. Control-channel traffic (e.g. the
+					// viewer_stats heartbeat) does not reset it, so an open-but-
+					// unattended viewer still idles out.
+					lastInput := time.Unix(0, session.lastInputUnixNano.Load())
+					stop, reason := shouldStopForLifetime(now, startWall, lastInput, policy)
+					if !stop {
+						continue
+					}
+					if reason == "idle_timeout_exceeded" {
+						slog.Warn("Desktop session idle timeout, stopping",
+							"session", sessionID, "idleFor", now.Sub(lastInput).Round(time.Second))
+					} else {
 						slog.Warn("Desktop session reached max duration, stopping",
 							"session", sessionID, "maxDuration", policy.MaxDuration)
-						m.StopSession(sessionID)
-						if m.OnSessionStopped != nil {
-							go m.OnSessionStopped(sessionID)
-						}
-						return
 					}
-					if policy.IdleTimeout > 0 {
-						idleFor := now.Sub(time.Unix(0, session.lastInputUnixNano.Load()))
-						if idleFor >= policy.IdleTimeout {
-							slog.Warn("Desktop session idle timeout, stopping",
-								"session", sessionID, "idleFor", idleFor.Round(time.Second))
-							m.StopSession(sessionID)
-							if m.OnSessionStopped != nil {
-								go m.OnSessionStopped(sessionID)
-							}
-							return
-						}
+					m.StopSession(sessionID)
+					if m.OnSessionStopped != nil {
+						go m.OnSessionStopped(sessionID)
 					}
+					return
 				}
 			}
 		}()
@@ -394,7 +394,7 @@ func (m *SessionManager) StartSession(sessionID string, offer string, iceServers
 	// never run the watcher (no passive exfiltration of whatever the end user
 	// copies); with viewer→host off inbound writes are dropped. Skip the channel
 	// entirely when both directions are disabled.
-	if policy.ClipboardHostToViewer || policy.ClipboardViewerToHost {
+	if policy.clipboardEnabled() {
 		clipboardDC, cbErr := peerConn.CreateDataChannel("clipboard", nil)
 		if cbErr != nil {
 			slog.Warn("Failed to create clipboard DataChannel", "session", sessionID, "error", cbErr.Error())
