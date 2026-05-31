@@ -14,6 +14,7 @@ import {
   getFrontendBaseUrl,
   acquireClientCredentialsToken,
   testGraphAccess,
+  isM365TenantId,
 } from '../../services/c2cM365';
 import { resolveScopedOrgId } from './helpers';
 import { getCookieValue } from '../auth/helpers';
@@ -220,6 +221,16 @@ m365CallbackRoute.get('/c2c/m365/callback', async (c) => {
     console.warn('[c2c/m365/callback] Admin consent not granted', { tenantId, adminConsent, orgId: session.orgId });
     clearCookie();
     return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent('Admin consent was not granted')}`);
+  }
+
+  // Microsoft returns the concrete Entra tenant GUID here; reject anything that
+  // doesn't match before it flows into token acquisition or storage. The guard
+  // narrows `tenantId` to the branded `M365TenantId` for the rest of the
+  // handler, so it flows into acquireClientCredentialsToken without a cast.
+  if (!isM365TenantId(tenantId)) {
+    console.warn('[c2c/m365/callback] Rejected non-GUID tenant in callback', { orgId: session.orgId });
+    clearCookie();
+    return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent('Invalid tenant identifier')}`);
   }
 
   try {

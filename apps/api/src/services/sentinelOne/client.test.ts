@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SentinelOneClient } from './client';
+import { SentinelOneClient, SentinelOneHttpError } from './client';
 
 const ORIGINAL_MAX_PAGES = process.env.S1_SYNC_MAX_PAGES;
 const { safeFetchMock } = vi.hoisted(() => ({
@@ -87,11 +87,38 @@ describe('SentinelOneClient error handling', () => {
     expect(safeFetchMock).not.toHaveBeenCalled();
   });
 
-  it('throws on non-OK HTTP response with status and body', async () => {
+  it('rejects HTTPS management URLs outside the .sentinelone.net allowlist before sending tokens', () => {
+    expect(() => new SentinelOneClient({
+      managementUrl: 'https://internal-vault.cluster.local',
+      apiToken: 'token',
+    })).toThrow(/sentinelone|allowed/i);
+    // Fail closed: the token must never reach egress for a non-allowed host.
+    expect(safeFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects look-alike hosts that only embed sentinelone.net as a substring', () => {
+    // .endsWith('.sentinelone.net') correctly rejects this — the host ends with
+    // .attacker.test, guarding against suffix-vs-substring confusion.
+    expect(() => new SentinelOneClient({
+      managementUrl: 'https://evil-sentinelone.net.attacker.test',
+      apiToken: 'token',
+    })).toThrow();
+    expect(safeFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts regional/partner .sentinelone.net subdomains', () => {
+    expect(() => new SentinelOneClient({
+      managementUrl: 'https://usea1-partners.sentinelone.net',
+      apiToken: 'token',
+    })).not.toThrow();
+  });
+
+  it('throws a SentinelOneHttpError with body-free message and status on non-OK HTTP response', async () => {
+    const bodyMarker = 'Unauthorized: Invalid API token';
     safeFetchMock.mockResolvedValue({
       ok: false,
       status: 401,
-      text: async () => 'Unauthorized: Invalid API token',
+      text: async () => bodyMarker,
     });
 
     const client = new SentinelOneClient({
@@ -99,8 +126,21 @@ describe('SentinelOneClient error handling', () => {
       apiToken: 'bad-token',
     });
 
-    await expect(client.listAgents()).rejects.toThrow('failed (401)');
-    await expect(client.listAgents()).rejects.toThrow('Unauthorized');
+    const error = await client.listAgents().then(
+      () => { throw new Error('expected listAgents to reject'); },
+      (err: unknown) => err,
+    );
+
+    // Typed error with structured status + raw body retained for server-side logging.
+    expect(error).toBeInstanceOf(SentinelOneHttpError);
+    const httpError = error as SentinelOneHttpError;
+    expect(httpError.status).toBe(401);
+    expect(httpError.responseBody).toContain(bodyMarker);
+
+    // SECURITY: the upstream body must NOT be reflected into `.message` (the
+    // tenant-visible surface). `.message` is the body-free status line only.
+    expect(httpError.message).toBe('SentinelOne API GET /web/api/v2.1/agents failed (401)');
+    expect(httpError.message).not.toContain(bodyMarker);
   });
 
   it('throws on non-object JSON response', async () => {
