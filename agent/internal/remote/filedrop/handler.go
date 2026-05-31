@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -274,10 +275,12 @@ func (h *FileDropHandler) handleStart(message Message) error {
 		file: file,
 	}
 
-	// Audit the start of an inbound file drop (finding #8): the viewer is
-	// pushing a file onto the host. name + declared size + transfer id.
-	log.Printf("[audit] filedrop start name=%q bytes=%d transferId=%s",
-		safeName, message.Size, message.TransferID)
+	// NOTE: diagnostic-log (slog → agent_logs), not central audit_logs.
+	// TODO(#1012): route clipboard/filedrop transfers to central audit_logs.
+	slog.Info("filedrop start",
+		"name", safeName,
+		"bytes", message.Size,
+		"transferId", message.TransferID)
 
 	return nil
 }
@@ -351,10 +354,12 @@ func (h *FileDropHandler) handleComplete(message Message) error {
 		Size:       transfer.size,
 	}
 
-	// Audit completion of an inbound file drop (finding #8): file fully written
-	// to the host. name + size + transfer id.
-	log.Printf("[audit] filedrop complete name=%q bytes=%d transferId=%s",
-		transfer.name, transfer.size, message.TransferID)
+	// NOTE: diagnostic-log (slog → agent_logs), not central audit_logs.
+	// TODO(#1012): route clipboard/filedrop transfers to central audit_logs.
+	slog.Info("filedrop complete",
+		"name", transfer.name,
+		"bytes", transfer.size,
+		"transferId", message.TransferID)
 
 	select {
 	case h.completed <- result:

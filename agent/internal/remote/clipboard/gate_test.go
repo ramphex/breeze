@@ -1,6 +1,9 @@
 package clipboard
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,6 +106,11 @@ func TestClipboardWatchGate_HostToViewerEnabled(t *testing.T) {
 // clipboard untouched.
 func TestClipboardReceiveGate_ViewerToHostDisabled(t *testing.T) {
 	prov := &gateProvider{}
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(originalLogger)
+
 	c := &ClipboardSync{
 		sender:       &gateSender{},
 		provider:     prov,
@@ -116,6 +124,9 @@ func TestClipboardReceiveGate_ViewerToHostDisabled(t *testing.T) {
 	}
 	if got := prov.setCount(); got != 0 {
 		t.Fatalf("viewer→host disabled: expected host clipboard untouched, got %d SetContent calls", got)
+	}
+	if got := logs.String(); !strings.Contains(got, "clipboard transfer blocked by policy") {
+		t.Fatalf("viewer→host disabled: expected blocked transfer audit log, got %q", got)
 	}
 }
 
