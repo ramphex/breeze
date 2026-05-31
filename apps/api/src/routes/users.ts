@@ -23,6 +23,7 @@ import { INVITE_TOKEN_TTL_SECONDS } from './auth/schemas';
 import { hashInviteToken, inviteRedisKey, inviteUserRedisKey, requireCurrentPasswordStepUp, resolveUserAuditOrgId, userRequiresSetup } from './auth/helpers';
 import { isPasswordAuthDisabledBySso } from './auth/ssoPolicy';
 import { revokeUserAccess } from '../services/userSuspension';
+import { terminateUserRemoteSessions } from '../services/remoteSessionTeardown';
 import { revokeAllUserTokens } from '../services/tokenRevocation';
 
 export const userRoutes = new Hono();
@@ -1050,6 +1051,11 @@ userRoutes.patch(
 
     let oauthRevocation: Awaited<ReturnType<typeof revokeUserAccess>> | undefined;
     if (becameInactive) {
+      // Kill any live remote-desktop sessions immediately so a suspended /
+      // deactivated operator loses screen, input and clipboard control right
+      // away — revoking JWT/OAuth alone does not touch viewer tokens or the
+      // peer-to-peer WebRTC stream. Best-effort (never throws). Finding #3.
+      await terminateUserRemoteSessions(updated.id);
       try {
         oauthRevocation = await revokeUserAccess(updated.id);
       } catch (err) {
