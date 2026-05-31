@@ -12,29 +12,31 @@
 --
 -- Shape: like the Phase-5 device-join policies, but the join target is the
 -- table's actual parent (automations / configuration_policies / ai_sessions /
--- scripts / software_catalog / alerts) rather than `devices`. The org axis is
--- the PARENT's org_id, reached via breeze_has_org_access(parent.org_id).
+-- software_catalog / alerts) rather than `devices`. The org axis is the
+-- PARENT's org_id, reached via breeze_has_org_access(parent.org_id).
 --
--- Safety (why this cannot break existing writes): every one of these child
--- rows is created/updated in the SAME db-access context as a sibling that is
--- ALREADY RLS-protected through the same parent (e.g. ai_messages alongside
--- ai_sessions, automation_runs alongside automations, script_execution_batches
--- alongside script_executions). A context that can write the protected sibling
--- necessarily reaches the parent's org, so these EXISTS policies pass wherever
--- the existing ones already pass. System/background writers run under
--- withSystemDbAccessContext, where breeze_has_org_access short-circuits TRUE.
+-- This works because every listed parent has a NOT-NULL org_id, so the child's
+-- EXISTS join reduces to breeze_has_org_access(<a real org>) — the path that
+-- evaluates correctly under the production driver's bound-parameter writes.
+-- (A parent with a NULLABLE org_id needing an `is_system`-style branch does NOT
+-- work as a nested-RLS join under bound parameters; script_execution_batches is
+-- exactly that case and is handled by denormalization in
+-- 2026-05-31-script-execution-batches-org-id.sql instead — NOT here.)
 --
--- Two special cases:
+-- Safety (why this cannot break existing writes): each of these child rows is
+-- created/updated in a db-access context that already reaches the parent's org
+-- (you cannot create a child of a parent you cannot see). The child's EXISTS
+-- join evaluates breeze_has_org_access against the parent's org, so it passes
+-- in exactly the contexts the parent's own policy already passes. System/
+-- background writers run under withSystemDbAccessContext, where
+-- breeze_has_org_access short-circuits TRUE.
+--
+-- One special case:
 --   * automation_runs reaches its org via EITHER automation_id -> automations
 --     OR config_policy_id -> configuration_policies (config-policy-driven runs
 --     leave automation_id NULL). The policy OR's both EXISTS branches so
---     neither run flavor becomes invisible/uninsertable.
---   * script_execution_batches' parent `scripts` has a NULLABLE org_id: system
---     scripts (is_system = true, org_id = NULL) are world-readable by design
---     (see 2026-05-15-scripts-is-system-rls-select.sql). The batch policy
---     mirrors that: `s.is_system = true OR breeze_has_org_access(s.org_id)`, so
---     running a built-in script (which inserts a batch under tenant context)
---     keeps working.
+--     neither run flavor becomes invisible/uninsertable. Both parents have a
+--     NOT-NULL org_id, so each branch is a breeze_has_org_access(<real org>).
 --
 -- Idempotent: DROP POLICY IF EXISTS x4 before each CREATE; ENABLE/FORCE are
 -- no-ops when already set. Re-running converges to the same state.
@@ -117,29 +119,12 @@ CREATE POLICY breeze_org_isolation_delete ON ai_tool_executions FOR DELETE USING
   EXISTS (SELECT 1 FROM ai_sessions s WHERE s.id = ai_tool_executions.session_id AND public.breeze_has_org_access(s.org_id))
 );
 
--- ---------------------------------------------------------------------------
--- script_execution_batches  ->  scripts(script_id)  [system scripts world-readable]
--- ---------------------------------------------------------------------------
-DROP POLICY IF EXISTS breeze_org_isolation_select ON script_execution_batches;
-DROP POLICY IF EXISTS breeze_org_isolation_insert ON script_execution_batches;
-DROP POLICY IF EXISTS breeze_org_isolation_update ON script_execution_batches;
-DROP POLICY IF EXISTS breeze_org_isolation_delete ON script_execution_batches;
-ALTER TABLE script_execution_batches ENABLE ROW LEVEL SECURITY;
-ALTER TABLE script_execution_batches FORCE ROW LEVEL SECURITY;
-CREATE POLICY breeze_org_isolation_select ON script_execution_batches FOR SELECT USING (
-  EXISTS (SELECT 1 FROM scripts s WHERE s.id = script_execution_batches.script_id AND (s.is_system = true OR public.breeze_has_org_access(s.org_id)))
-);
-CREATE POLICY breeze_org_isolation_insert ON script_execution_batches FOR INSERT WITH CHECK (
-  EXISTS (SELECT 1 FROM scripts s WHERE s.id = script_execution_batches.script_id AND (s.is_system = true OR public.breeze_has_org_access(s.org_id)))
-);
-CREATE POLICY breeze_org_isolation_update ON script_execution_batches FOR UPDATE USING (
-  EXISTS (SELECT 1 FROM scripts s WHERE s.id = script_execution_batches.script_id AND (s.is_system = true OR public.breeze_has_org_access(s.org_id)))
-) WITH CHECK (
-  EXISTS (SELECT 1 FROM scripts s WHERE s.id = script_execution_batches.script_id AND (s.is_system = true OR public.breeze_has_org_access(s.org_id)))
-);
-CREATE POLICY breeze_org_isolation_delete ON script_execution_batches FOR DELETE USING (
-  EXISTS (SELECT 1 FROM scripts s WHERE s.id = script_execution_batches.script_id AND (s.is_system = true OR public.breeze_has_org_access(s.org_id)))
-);
+-- NOTE: script_execution_batches is intentionally NOT handled here. Its parent
+-- `scripts` has a nullable org_id (system scripts), and a nested-RLS EXISTS
+-- through scripts could not satisfy the system-script INSERT under bound-
+-- parameter (extended-protocol) writes — the production driver. It is given a
+-- denormalized org_id + a direct org policy in
+-- 2026-05-31-script-execution-batches-org-id.sql instead.
 
 -- ---------------------------------------------------------------------------
 -- software_versions  ->  software_catalog(catalog_id)
@@ -167,6 +152,11 @@ CREATE POLICY breeze_org_isolation_delete ON software_versions FOR DELETE USING 
 
 -- ---------------------------------------------------------------------------
 -- alert_correlations  ->  alerts(parent_alert_id)
+-- Joined via parent_alert_id only. The table also has a NOT-NULL child_alert_id
+-- FK to alerts that is intentionally NOT org-checked here: the correlation
+-- engine only links alerts within one org, so the parent alert's org governs
+-- the row. If cross-org correlations ever become possible, gate child_alert_id
+-- too (or require both alerts to be org-accessible).
 -- ---------------------------------------------------------------------------
 DROP POLICY IF EXISTS breeze_org_isolation_select ON alert_correlations;
 DROP POLICY IF EXISTS breeze_org_isolation_insert ON alert_correlations;
