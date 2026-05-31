@@ -1,6 +1,6 @@
 import { and, eq, or, not, gt, gte, lt, lte, like, ilike, inArray, isNull, isNotNull, sql, SQL } from 'drizzle-orm';
 import { db } from '../db';
-import { devices, deviceHardware, deviceNetwork, deviceMetrics, deviceSoftware, deviceGroups, deviceGroupMemberships } from '../db/schema';
+import { devices, deviceHardware, deviceNetwork, deviceMetrics, deviceSoftware, deviceGroups, deviceGroupMemberships, softwareInventory } from '../db/schema';
 import type {
   FilterOperator,
   FilterFieldCategory,
@@ -57,13 +57,19 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
   // Core Device fields
   { key: 'hostname', label: 'Hostname', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
   { key: 'displayName', label: 'Display Name', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
-  { key: 'status', label: 'Status', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['online', 'offline', 'maintenance', 'decommissioned'] },
+  { key: 'status', label: 'Status', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] },
   { key: 'agentVersion', label: 'Agent Version', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
   { key: 'enrolledAt', label: 'Enrolled At', category: 'core', type: 'datetime', operators: OPERATORS_BY_TYPE.datetime },
   { key: 'lastSeenAt', label: 'Last Seen At', category: 'core', type: 'datetime', operators: OPERATORS_BY_TYPE.datetime },
   { key: 'tags', label: 'Tags', category: 'core', type: 'array', operators: OPERATORS_BY_TYPE.array },
   { key: 'deviceRole', label: 'Device Role', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum,
     enumValues: ['workstation', 'server', 'printer', 'router', 'switch', 'firewall', 'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown'] },
+  { key: 'lastUser', label: 'Last User', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'isHeadless', label: 'Headless', category: 'core', type: 'boolean', operators: OPERATORS_BY_TYPE.boolean },
+  { key: 'uptimeSeconds', label: 'Uptime (seconds)', category: 'core', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'watchdogStatus', label: 'Watchdog Status', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['connected', 'failover', 'offline'] },
+  { key: 'quarantinedAt', label: 'Quarantined At', category: 'core', type: 'datetime', operators: OPERATORS_BY_TYPE.datetime },
+  { key: 'lastSeenIp', label: 'Last Seen IP', category: 'network', type: 'string', operators: OPERATORS_BY_TYPE.string },
 
   // OS fields
   { key: 'osType', label: 'OS Type', category: 'os', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['windows', 'macos', 'linux'] },
@@ -91,9 +97,14 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
   { key: 'metrics.ramPercent', label: 'RAM %', category: 'metrics', type: 'number', operators: OPERATORS_BY_TYPE.number },
   { key: 'metrics.diskPercent', label: 'Disk %', category: 'metrics', type: 'number', operators: OPERATORS_BY_TYPE.number },
 
-  // Software fields
-  { key: 'software.installed', label: 'Has Software Installed', category: 'software', type: 'string', operators: ['contains', 'notContains'], description: 'Check if software name contains value' },
-  { key: 'software.notInstalled', label: 'Missing Software', category: 'software', type: 'string', operators: ['contains'], description: 'Check if software is not installed' },
+  // Software fields (EXISTS against software_inventory)
+  { key: 'software.installed', label: 'Has Software Installed', category: 'software', type: 'string', operators: ['contains', 'notContains', 'equals', 'in', 'hasAny', 'hasAll'], description: 'Match devices with matching installed software' },
+  { key: 'software.notInstalled', label: 'Missing Software', category: 'software', type: 'string', operators: ['contains', 'equals', 'in', 'hasAny'], description: 'Match devices missing the named software' },
+
+  // Device-state predicates (virtual EXISTS fields against related tables)
+  { key: 'patches.pending', label: 'Has Pending Patches', category: 'core', type: 'boolean', operators: ['equals', 'notEquals'], description: 'Device has at least one pending patch' },
+  { key: 'alerts.critical', label: 'Has Critical Alerts', category: 'core', type: 'boolean', operators: ['equals', 'notEquals'], description: 'Device has an active critical alert' },
+  { key: 'system.rebootRequired', label: 'Reboot Required', category: 'core', type: 'boolean', operators: ['equals', 'notEquals'], description: 'Device has a completed patch awaiting reboot' },
 
   // Hierarchy fields
   { key: 'orgId', label: 'Organization', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
@@ -183,40 +194,129 @@ function getColumnForField(field: string): { table: 'devices' | 'hardware' | 'ne
   return { table: 'devices', column: field };
 }
 
-function buildConditionSQL(condition: FilterCondition): SQL<unknown> {
+export function buildConditionSQL(condition: FilterCondition): SQL<unknown> {
   const { field, operator, value } = condition;
+
+  // Virtual boolean predicates resolved as self-contained EXISTS subqueries.
+  // The outer query selects from `devices` only (no joins), so each correlates
+  // on devices.id and needs no join. The chip bar emits `equals 'yes'`/`'no'`;
+  // the advanced builder may send a real boolean — treat false/'no'/'false' as
+  // the negative, and `notEquals` flips the polarity.
+  if (field === 'patches.pending' || field === 'alerts.critical' || field === 'system.rebootRequired') {
+    let inner: SQL<unknown>;
+    if (field === 'patches.pending') {
+      inner = sql`EXISTS (SELECT 1 FROM device_patches WHERE device_id = ${devices.id} AND status = 'pending')`;
+    } else if (field === 'alerts.critical') {
+      inner = sql`EXISTS (SELECT 1 FROM alerts WHERE device_id = ${devices.id} AND status = 'active' AND severity = 'critical')`;
+    } else {
+      inner = sql`EXISTS (SELECT 1 FROM patch_job_results WHERE device_id = ${devices.id} AND reboot_required = true AND rebooted_at IS NULL)`;
+    }
+    const negative = value === false || value === 'no' || value === 'false';
+    const negate = (operator === 'notEquals') !== negative;
+    return negate ? sql`NOT (${inner})` : inner;
+  }
+
   const fieldInfo = getColumnForField(field);
 
-  // Get the actual column reference
-  let columnRef: SQL<unknown>;
+  // Installed-software predicates use an EXISTS subquery against
+  // software_inventory — the table the agent inventory ingest actually
+  // populates (device_software is unused). `software.notInstalled` is the
+  // negation of `software.installed`. Self-contained, so no outer join.
+  if (fieldInfo.table === 'software') {
+    const positive = field === 'software.installed';
+    let match: SQL<unknown>;
+    switch (operator) {
+      case 'contains':
+      case 'notContains':
+        match = sql`${softwareInventory.name} ILIKE ${'%' + String(value) + '%'}`;
+        break;
+      case 'equals':
+        match = sql`${softwareInventory.name} = ${String(value)}`;
+        break;
+      case 'in':
+      case 'hasAny': {
+        if (!Array.isArray(value) || value.length === 0) return sql`TRUE`;
+        // Explicit IN list — an ANY($1) array binding inside EXISTS doesn't
+        // infer the text[] cast and errors with "malformed array literal".
+        const names = (value as unknown[]).map((v) => sql`${String(v)}`);
+        match = sql`${softwareInventory.name} IN (${sql.join(names, sql`, `)})`;
+        break;
+      }
+      case 'hasAll': {
+        if (!Array.isArray(value) || value.length === 0) return sql`TRUE`;
+        const all = (value as unknown[])
+          .map((v) => sql`EXISTS (SELECT 1 FROM ${softwareInventory} WHERE ${softwareInventory.deviceId} = ${devices.id} AND ${softwareInventory.name} = ${String(v)})`)
+          .reduce((acc, part) => sql`${acc} AND ${part}`);
+        return positive ? all : sql`NOT (${all})`;
+      }
+      default:
+        throw new Error(`Unsupported software operator: ${operator}`);
+    }
+    const inner = sql`EXISTS (SELECT 1 FROM ${softwareInventory} WHERE ${softwareInventory.deviceId} = ${devices.id} AND ${match})`;
+    // notContains is its own negation regardless of installed/notInstalled.
+    if (operator === 'notContains') return sql`NOT (${inner})`;
+    return positive ? inner : sql`NOT (${inner})`;
+  }
 
+  // Resolve the field to a predicate. Device columns (and computed
+  // expressions) compare directly; related tables are reached via correlated
+  // subqueries so the list query stays `FROM devices` with no joins (no row
+  // multiplication, no pagination/RLS interaction). This closes the long-
+  // standing "we'd add the joins here" gap — hardware/network/metrics/group
+  // filters previously errored (unjoined table / unsupported).
   if (fieldInfo.computed) {
-    columnRef = fieldInfo.computed;
-  } else if (fieldInfo.table === 'devices') {
+    return applyOperator(fieldInfo.computed, operator, value);
+  }
+  if (fieldInfo.table === 'devices') {
     const col = devices[fieldInfo.column as keyof typeof devices];
     if (!col) {
       throw new Error(`Unknown device field: ${fieldInfo.column}`);
     }
-    columnRef = sql`${col}`;
-  } else if (fieldInfo.table === 'hardware') {
+    return applyOperator(sql`${col}`, operator, value);
+  }
+  if (fieldInfo.table === 'hardware') {
     const col = deviceHardware[fieldInfo.column as keyof typeof deviceHardware];
     if (!col) {
       throw new Error(`Unknown hardware field: ${fieldInfo.column}`);
     }
-    columnRef = sql`${col}`;
-  } else if (fieldInfo.table === 'network') {
+    // device_hardware is 1:1 with devices (device_id is PK).
+    return sql`EXISTS (SELECT 1 FROM ${deviceHardware} WHERE ${deviceHardware.deviceId} = ${devices.id} AND ${applyOperator(sql`${col}`, operator, value)})`;
+  }
+  if (fieldInfo.table === 'network') {
     const col = deviceNetwork[fieldInfo.column as keyof typeof deviceNetwork];
     if (!col) {
       throw new Error(`Unknown network field: ${fieldInfo.column}`);
     }
-    columnRef = sql`${col}`;
-  } else if (fieldInfo.table === 'groups') {
-    columnRef = sql`${deviceGroupMemberships.groupId}`;
-  } else {
-    throw new Error(`Unsupported table: ${fieldInfo.table}`);
+    // device_network is 1:many (interfaces); EXISTS = "any interface matches".
+    return sql`EXISTS (SELECT 1 FROM ${deviceNetwork} WHERE ${deviceNetwork.deviceId} = ${devices.id} AND ${applyOperator(sql`${col}`, operator, value)})`;
   }
+  if (fieldInfo.table === 'metrics') {
+    const col = deviceMetrics[fieldInfo.column as keyof typeof deviceMetrics];
+    if (!col) {
+      throw new Error(`Unknown metrics field: ${fieldInfo.column}`);
+    }
+    // device_metrics is time-series; filter on the latest sample per device.
+    // The (device_id, timestamp) PK makes the per-device lookup an index scan.
+    const latest = sql`(SELECT ${col} FROM ${deviceMetrics} WHERE ${deviceMetrics.deviceId} = ${devices.id} ORDER BY ${deviceMetrics.timestamp} DESC LIMIT 1)`;
+    return applyOperator(latest, operator, value);
+  }
+  if (fieldInfo.table === 'groups') {
+    // Membership test against device_group_memberships.
+    if (operator === 'equals') {
+      return sql`EXISTS (SELECT 1 FROM ${deviceGroupMemberships} WHERE ${deviceGroupMemberships.deviceId} = ${devices.id} AND ${deviceGroupMemberships.groupId} = ${value})`;
+    }
+    if (operator === 'in' && Array.isArray(value)) {
+      return sql`EXISTS (SELECT 1 FROM ${deviceGroupMemberships} WHERE ${deviceGroupMemberships.deviceId} = ${devices.id} AND ${deviceGroupMemberships.groupId} = ANY(${value}))`;
+    }
+    throw new Error(`Unsupported operator for groupId: ${operator}`);
+  }
+  throw new Error(`Unsupported table: ${fieldInfo.table}`);
+}
 
-  // Build the SQL condition based on operator
+// Build a SQL predicate applying an operator to a column expression. The
+// expression may be a plain device column or a correlated subquery (related
+// tables / latest-metric), so this stays purely about operator semantics.
+function applyOperator(columnRef: SQL<unknown>, operator: FilterOperator, value: FilterValue): SQL<unknown> {
   switch (operator) {
     case 'equals':
       return sql`${columnRef} = ${value}`;
