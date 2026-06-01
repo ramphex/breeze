@@ -71,6 +71,16 @@ export interface AiTool {
   definition: Anthropic.Tool;
   tier: AiToolTier;
   handler: (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
+  /**
+   * Names of the tool's input properties that carry a device id (each a string
+   * or string[]). When set, the central dispatch gates every supplied id
+   * through the org+site `verifyDeviceAccess` BEFORE the handler runs — so a
+   * tool author can no longer forget the per-device tenant check (the root
+   * cause of the cross-org incident-tool bug). Tools that resolve the device
+   * indirectly (via a VM/snapshot/alert record) or return a device LIST are
+   * NOT covered by this and must still narrow results themselves.
+   */
+  deviceArgs?: readonly string[];
 }
 
 // ============================================
@@ -93,6 +103,47 @@ export async function verifyDeviceAccess(
   }
   if (requireOnline && device.status !== 'online') return { error: `Device ${device.hostname} is not online (status: ${device.status})` };
   return { device };
+}
+
+/** Decision returned by {@link enforceDeviceArgs}: allow, or deny with a reason.
+ *  The caller (`executeTool`) owns serialization to the wire format. */
+export type DeviceGateResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * Central declarative device-access gate. For each input property a tool names
+ * in `deviceArgs`, runs the org+site `verifyDeviceAccess` check on every id it
+ * carries (string or string[]). Returns `{ ok: false }` on the first denial,
+ * else `{ ok: true }`.
+ *
+ * Fail-closed: a tool with no `deviceArgs`, or an optional arg the caller did
+ * not supply, is allowed (nothing to gate); but a declared arg that IS present
+ * must be a non-empty string id (or array of them) — anything else is DENIED
+ * rather than skipped, so the gate does not depend on an upstream validator it
+ * cannot see. For a truly unrestricted caller `verifyDeviceAccess` returns the
+ * row, so the gate degrades to a plain existence check. This is the structural
+ * backstop that makes the per-handler check impossible to forget — see
+ * `executeTool`.
+ */
+export async function enforceDeviceArgs(
+  tool: Pick<AiTool, 'deviceArgs'>,
+  input: Record<string, unknown>,
+  auth: AuthContext
+): Promise<DeviceGateResult> {
+  if (!tool.deviceArgs || tool.deviceArgs.length === 0) return { ok: true };
+  const denied: DeviceGateResult = { ok: false, error: 'Device not found or access denied' };
+  for (const argName of tool.deviceArgs) {
+    const raw = input[argName];
+    if (raw == null) continue; // optional arg not supplied — nothing to gate
+    const ids = Array.isArray(raw) ? raw : [raw];
+    for (const id of ids) {
+      // A declared device arg that is present must be a non-empty string.
+      // Fail closed on anything else instead of trusting upstream validation.
+      if (typeof id !== 'string' || id.length === 0) return denied;
+      const access = await verifyDeviceAccess(id, auth);
+      if ('error' in access) return { ok: false, error: access.error };
+    }
+  }
+  return { ok: true };
 }
 
 export async function findAlertWithAccess(alertId: string, auth: AuthContext) {
@@ -206,6 +257,12 @@ export async function executeTool(
   if (!validation.success) {
     return JSON.stringify({ error: validation.error });
   }
+
+  // Structural device-tenant gate: any id named in `tool.deviceArgs` is
+  // org+site-checked before the handler runs, so a tool can't reach a device
+  // outside the caller's scope even if its handler forgets to check.
+  const gate = await enforceDeviceArgs(tool, input, auth);
+  if (!gate.ok) return JSON.stringify({ error: gate.error });
 
   return tool.handler(input, auth);
 }

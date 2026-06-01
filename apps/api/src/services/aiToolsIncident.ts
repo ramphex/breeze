@@ -42,6 +42,7 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 2 as AiToolTier,
+    deviceArgs: ['affectedDeviceIds'],
     definition: {
       name: 'create_incident',
       description:
@@ -172,6 +173,7 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3 as AiToolTier,
+    deviceArgs: ['deviceId'],
     definition: {
       name: 'execute_containment',
       description:
@@ -275,6 +277,7 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 2 as AiToolTier,
+    deviceArgs: ['deviceId'],
     definition: {
       name: 'collect_evidence',
       description:
