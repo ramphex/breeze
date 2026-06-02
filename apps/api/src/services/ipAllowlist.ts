@@ -45,9 +45,8 @@ export function ipAllowlistMode(): IpAllowlistMode {
 }
 
 // --- Per-partner allowlist read with a short in-process cache -----------------
-// Trade-off (per spec): a change propagates to other API instances within the
-// TTL; the writing instance invalidates immediately. The login check is always
-// immediate because it reads fresh below only on a cache miss.
+// All read paths (per-request guard and login) share this cache. The writing
+// instance invalidates on save; other API instances converge within the TTL.
 
 const CACHE_TTL_MS = 30_000;
 const cache = new Map<string, { value: string[]; expiresAt: number }>();
@@ -99,7 +98,7 @@ function warnInactiveAllowlist(partnerId: string): void {
 /**
  * Full enforcement for a request. Reads mode, allowlist, and trusted client IP,
  * evaluates, and writes audit on deny / platform-admin bypass. Returns the
- * decision so the caller can respond (middleware throws 403; login returns 403).
+ * decision so callers can return their own response (guard/API key/login).
  */
 export async function enforceIpAllowlist(
   c: RequestLike,
