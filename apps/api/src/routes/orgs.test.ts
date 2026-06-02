@@ -126,7 +126,7 @@ import { db } from '../db';
 import { sites } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
-import { clearPartnerAllowlistCache } from '../services/ipAllowlist';
+import { clearPartnerAllowlistCache, readPartnerAllowlist } from '../services/ipAllowlist';
 import {
   restoreOrganizationTenantAccess,
   restorePartnerTenantAccess,
@@ -1455,6 +1455,37 @@ describe('org routes', () => {
       const res = await app.request('/orgs/partners/me');
 
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe('GET /partners/me/ip-allowlist/status', () => {
+    async function getStatus() {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      return app.request('/orgs/partners/me/ip-allowlist/status');
+    }
+
+    it('reports the current trusted IP and active=false when not enforced', async () => {
+      vi.mocked(getTrustedClientIpOrUndefined).mockReturnValue('203.0.113.10');
+      vi.mocked(readPartnerAllowlist).mockResolvedValueOnce([]);
+
+      const res = await getStatus();
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        currentIp: '203.0.113.10',
+        proxyTrustOk: true,
+        enforced: false,
+        active: false,
+      });
+    });
+
+    it('reports active=true when an allowlist is set and the IP is trusted', async () => {
+      vi.mocked(getTrustedClientIpOrUndefined).mockReturnValue('203.0.113.10');
+      vi.mocked(readPartnerAllowlist).mockResolvedValueOnce(['203.0.113.0/24']);
+
+      const res = await getStatus();
+
+      expect(await res.json()).toMatchObject({ enforced: true, proxyTrustOk: true, active: true });
     });
   });
 

@@ -21,7 +21,7 @@ import { encryptColumnValueForWrite } from '../services/encryptedColumnRegistry'
 import { isAllowedLauncherScheme } from '@breeze/shared';
 import { isValidIpOrCidr } from '../services/ipMatch';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
-import { clearPartnerAllowlistCache } from '../services/ipAllowlist';
+import { clearPartnerAllowlistCache, ipAllowlistMode, readPartnerAllowlist } from '../services/ipAllowlist';
 
 export const orgRoutes = new Hono();
 const requireOrgRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
@@ -401,6 +401,23 @@ orgRoutes.get('/partners/me', requireScope('partner'), requirePartner, requireOr
   }
 
   return c.json(partner);
+});
+
+orgRoutes.get('/partners/me/ip-allowlist/status', requireScope('partner'), requirePartner, requireOrgRead, async (c) => {
+  const auth = c.get('auth');
+  const partnerId = auth.partnerId as string;
+
+  const currentIp = getTrustedClientIpOrUndefined(c) ?? null;
+  const allowlist = await readPartnerAllowlist(partnerId);
+  const enforced = ipAllowlistMode() === 'enforce' && allowlist.length > 0;
+  const proxyTrustOk = currentIp !== null;
+
+  return c.json({
+    currentIp,
+    proxyTrustOk,
+    enforced,
+    active: enforced && proxyTrustOk,
+  });
 });
 
 // Update own partner settings (for partner-scoped users)
