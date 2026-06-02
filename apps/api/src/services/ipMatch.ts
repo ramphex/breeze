@@ -39,8 +39,8 @@ function ipv6ToInt(ip: string): bigint | null {
     return out;
   };
 
-  const head = expand(halves[0]);
-  const tail = halves.length === 2 ? expand(halves[1]) : [];
+  const head = expand(halves[0] ?? '');
+  const tail = halves.length === 2 ? expand(halves[1] ?? '') : [];
   if (head === null || tail === null) return null;
 
   let groups: string[];
