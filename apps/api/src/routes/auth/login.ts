@@ -51,7 +51,7 @@ import {
 } from './helpers';
 import { assertPasswordAuthAllowedBySso, SsoPasswordAuthRequiredError } from './ssoPolicy';
 import { readMobileDeviceId, carryForwardBinding } from '../../services/mobileDeviceBinding';
-import { enforceIpAllowlist } from '../../services/ipAllowlist';
+import { enforceIpAllowlist, IP_NOT_ALLOWED_BODY, isBlocked } from '../../services/ipAllowlist';
 import { captureException } from '../../services/sentry';
 
 const { db, withSystemDbAccessContext } = dbModule;
@@ -373,7 +373,7 @@ loginRoutes.post('/login', zValidator('json', loginSchema), async (c) => {
     await floorPromise;
     return c.json(genericAuthError(), 401);
   }
-  if (ipDecision.decision === 'deny') {
+  if (isBlocked(ipDecision)) {
     void auditUserLoginFailure(c, {
       userId: user.id,
       email: user.email,
@@ -383,7 +383,7 @@ loginRoutes.post('/login', zValidator('json', loginSchema), async (c) => {
       details: { method: 'password' },
     });
     await floorPromise;
-    return c.json({ code: 'ip_not_allowed', error: 'Access denied from this IP address' }, 403);
+    return c.json(IP_NOT_ALLOWED_BODY, 403);
   }
 
   // Check if MFA is required. This happens after the SSO-only check so an

@@ -11,7 +11,16 @@ export type IpAllowlistMode = 'enforce' | 'off';
 export type IpAllowlistDecision =
   | { decision: 'allow' }
   | { decision: 'deny'; reason: 'not_in_list' }
-  | { decision: 'skip'; reason: 'mode_off' | 'empty_list' | 'untrusted_ip' | 'platform_admin' };
+  | { decision: 'skip'; reason: 'mode_off' | 'empty_list' | 'untrusted_ip' | 'platform_admin' | 'no_partner' };
+
+export const IP_NOT_ALLOWED_BODY = {
+  code: 'ip_not_allowed',
+  error: 'Access denied from this IP address',
+} as const;
+
+export function isBlocked(d: IpAllowlistDecision): boolean {
+  return d.decision === 'deny';
+}
 
 /** Pure decision. `clientIp === undefined` means the IP is not trustable. */
 export function evaluateIpAllowlist(params: {
@@ -96,7 +105,7 @@ export async function enforceIpAllowlist(
   c: RequestLike,
   params: { partnerId: string | null; isPlatformAdmin: boolean; actorId?: string | null; actorEmail?: string | null },
 ): Promise<IpAllowlistDecision> {
-  if (!params.partnerId) return { decision: 'skip', reason: 'empty_list' };
+  if (!params.partnerId) return { decision: 'skip', reason: 'no_partner' };
 
   const mode = ipAllowlistMode();
   const readList = () => readPartnerAllowlist(params.partnerId as string);
@@ -112,7 +121,7 @@ export async function enforceIpAllowlist(
     isPlatformAdmin: params.isPlatformAdmin,
   });
 
-  if (decision.decision === 'deny') {
+  if (isBlocked(decision)) {
     writeAuditEvent(c, {
       orgId: null,
       action: 'ip_allowlist.denied',

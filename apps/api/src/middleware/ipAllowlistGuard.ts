@@ -1,5 +1,5 @@
 import type { Context, Next } from 'hono';
-import { enforceIpAllowlist } from '../services/ipAllowlist';
+import { enforceIpAllowlist, IP_NOT_ALLOWED_BODY, isBlocked } from '../services/ipAllowlist';
 import { captureException } from '../services/sentry';
 
 /**
@@ -21,8 +21,8 @@ export async function ipAllowlistGuard(c: Context, next: Next): Promise<void | R
     captureException(err, c);
     return c.json({ code: 'ip_check_failed', error: 'Access temporarily unavailable' }, 503);
   }
-  if (decision.decision === 'deny') {
-    return c.json({ code: 'ip_not_allowed', error: 'Access denied from this IP address' }, 403);
+  if (isBlocked(decision)) {
+    return c.json(IP_NOT_ALLOWED_BODY, 403);
   }
   await next();
 }

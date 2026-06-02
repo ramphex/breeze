@@ -115,6 +115,8 @@ vi.mock('./schemas', async () => {
 
 vi.mock('../../services/ipAllowlist', () => ({
   enforceIpAllowlist: vi.fn(),
+  IP_NOT_ALLOWED_BODY: { code: 'ip_not_allowed', error: 'Access denied from this IP address' },
+  isBlocked: (decision: { decision: string }) => decision.decision === 'deny',
 }));
 
 vi.mock('../../services/sentry', () => ({
