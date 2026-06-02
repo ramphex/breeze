@@ -19,6 +19,9 @@ import { applyOrganizationOrder, sanitizeOrganizationOrder } from '../services/o
 import { captureException } from '../services/sentry';
 import { encryptColumnValueForWrite } from '../services/encryptedColumnRegistry';
 import { isAllowedLauncherScheme } from '@breeze/shared';
+import { isValidIpOrCidr } from '../services/ipMatch';
+import { getTrustedClientIpOrUndefined } from '../services/clientIp';
+import { clearPartnerAllowlistCache } from '../services/ipAllowlist';
 
 export const orgRoutes = new Hono();
 const requireOrgRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
@@ -281,7 +284,13 @@ const partnerSettingsSchema = z.object({
     allowedMethods: z.object({ totp: z.boolean().optional(), sms: z.boolean().optional() }).optional(),
     sessionTimeout: z.number().int().min(1).optional(),
     maxSessions: z.number().int().min(1).optional(),
-    ipAllowlist: z.array(z.string()).optional(),
+    ipAllowlist: z
+      .array(z.string())
+      .optional()
+      .refine(
+        (list) => !list || list.every((entry) => isValidIpOrCidr(entry)),
+        { message: 'Each IP allowlist entry must be a valid IP address or CIDR range' },
+      ),
   }).optional(),
   notifications: z.object({
     fromAddress: z.string().optional(),
@@ -416,6 +425,23 @@ orgRoutes.patch('/partners/me', requireScope('partner'), requirePartner, require
     ? { ...currentSettings, ...body.settings }
     : currentSettings;
 
+  // Enable-gate: turning the allowlist on (empty -> non-empty) requires that
+  // the API can actually see real client IPs, otherwise enforcement would
+  // silently fail open (false security).
+  const prevAllowlist = ((((current.settings as Record<string, unknown>)?.security) as Record<string, unknown>)?.ipAllowlist) as string[] | undefined;
+  const nextAllowlist = ((newSettings.security as Record<string, unknown>)?.ipAllowlist) as string[] | undefined;
+  const turningOn = (!prevAllowlist || prevAllowlist.length === 0) && Array.isArray(nextAllowlist) && nextAllowlist.length > 0;
+  if (turningOn && getTrustedClientIpOrUndefined(c) === undefined) {
+    return c.json(
+      {
+        code: 'proxy_trust_required',
+        error:
+          'Configure proxy trust (TRUST_PROXY_HEADERS + TRUSTED_PROXY_CIDRS) before enabling the IP allowlist, so the API can see real client IPs.',
+      },
+      400,
+    );
+  }
+
   // Encrypt secret-bearing fields (e.g. remoteAccessProviders[*].password)
   // BEFORE writing. Without this, every PATCH from the UI would regress the
   // column to plaintext between deploy-day batch re-encrypt runs.
@@ -441,6 +467,7 @@ orgRoutes.patch('/partners/me', requireScope('partner'), requirePartner, require
   // `settings.oauth_scope_policy.mcp_allowed_scopes` takes effect on the
   // next token mint without waiting for the 60s TTL.
   clearPartnerScopePolicyCache(partner.id);
+  clearPartnerAllowlistCache(partner.id);
 
   const auditOrgId = await resolveAuditOrgIdForPartner(auth.partnerId);
   writeRouteAudit(c, {

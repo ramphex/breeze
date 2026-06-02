@@ -9,6 +9,16 @@ vi.mock('../services/sentry', () => ({
   isSentryEnabled: vi.fn().mockReturnValue(false)
 }));
 
+vi.mock('../services/clientIp', () => ({
+  getTrustedClientIpOrUndefined: vi.fn()
+}));
+
+vi.mock('../services/ipAllowlist', () => ({
+  clearPartnerAllowlistCache: vi.fn(),
+  ipAllowlistMode: vi.fn(() => 'enforce'),
+  readPartnerAllowlist: vi.fn(async () => [])
+}));
+
 vi.mock('../services/tenantLifecycle', () => ({
   revokePartnerTenantAccess: vi.fn().mockResolvedValue({
     apiKeysRevoked: 0,
@@ -115,6 +125,8 @@ import { inArray } from 'drizzle-orm';
 import { db } from '../db';
 import { sites } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
+import { getTrustedClientIpOrUndefined } from '../services/clientIp';
+import { clearPartnerAllowlistCache } from '../services/ipAllowlist';
 import {
   restoreOrganizationTenantAccess,
   restorePartnerTenantAccess,
@@ -1749,6 +1761,63 @@ describe('org routes', () => {
       });
 
       expect(res.status).toBe(400);
+    });
+
+    describe('PATCH /partners/me — ipAllowlist', () => {
+      function mockPartnerSettingsUpdate(currentSettings: Record<string, unknown>) {
+        const currentPartner = { id: 'partner-123', name: 'Acme MSP', settings: currentSettings };
+        vi.mocked(db.select).mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([])
+              }),
+              limit: vi.fn().mockResolvedValue([currentPartner])
+            })
+          })
+        } as any);
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([currentPartner])
+            })
+          })
+        } as any);
+      }
+
+      async function patchPartner(body: unknown) {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        return app.request('/orgs/partners/me', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+      }
+
+      it('rejects a malformed CIDR entry with 400', async () => {
+        const res = await patchPartner({ settings: { security: { ipAllowlist: ['not-an-ip'] } } });
+        expect(res.status).toBe(400);
+      });
+
+      it('rejects enabling the allowlist when proxy trust is not configured (proxy_trust_required)', async () => {
+        mockPartnerSettingsUpdate({});
+        vi.mocked(getTrustedClientIpOrUndefined).mockReturnValue(undefined);
+
+        const res = await patchPartner({ settings: { security: { ipAllowlist: ['203.0.113.0/24'] } } });
+
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ code: 'proxy_trust_required' });
+      });
+
+      it('accepts a valid allowlist when proxy trust is working', async () => {
+        mockPartnerSettingsUpdate({});
+        vi.mocked(getTrustedClientIpOrUndefined).mockReturnValue('203.0.113.10');
+
+        const res = await patchPartner({ settings: { security: { ipAllowlist: ['203.0.113.0/24'] } } });
+
+        expect(res.status).toBe(200);
+        expect(clearPartnerAllowlistCache).toHaveBeenCalledWith('partner-123');
+      });
     });
   });
 
