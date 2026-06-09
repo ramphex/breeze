@@ -135,7 +135,28 @@ To report a vulnerability: **[security@lanternops.io](mailto:security@lanternops
 
 Skip infrastructure entirely. [Sign up at breezermm.com](https://breezermm.com) and have a fully managed Breeze instance in minutes.
 
-### Option 2: Self-Hosted (Docker)
+### Option 2: Self-Hosted Guided Setup
+
+Requires [Docker](https://docs.docker.com/get-docker/) and Docker Compose.
+
+Run the guided setup from an empty directory where you want Breeze's generated `.env` and `docker-compose.yml` files to live:
+
+```bash
+mkdir breeze && cd breeze
+curl -fsSLO https://raw.githubusercontent.com/lanternops/breeze/main/scripts/guided-setup.sh
+chmod +x guided-setup.sh
+./guided-setup.sh
+```
+
+The guided setup checks required commands, Docker Compose, CPU, RAM, and free disk space before generating configuration. It downloads the current `docker-compose.yml` and `.env.example`, preserves the comments from `.env.example` in your generated `.env`, prompts for the required settings, and can generate secure passwords and application secrets with `openssl rand`.
+
+During setup you can choose the packaged Caddy reverse proxy, Nginx Proxy Manager, or another external reverse proxy path. You can also choose Docker named volumes or local `./data` subdirectories for persistent container data.
+
+After the files are generated, the script lets you either stop with ready-to-use config files or continue and run `docker compose up -d`. If you continue, it guides you through creating the initial bootstrap admin account and then removes the one-time bootstrap admin values from `.env`.
+
+On Linux hosts with systemd, the guided setup can also install a reboot startup service for cleaner shutdowns and startups. On shutdown, it asks Docker Compose to stop the Breeze stack before Docker itself stops. On startup, it reruns Compose after Docker and networking are online, helping Breeze bring up Postgres/Redis, API/Web, and optional services in the intended order. The service stores its helper in a root-owned system path and points it at the setup directory you selected. For an existing guided install, run `./guided-setup.sh --install-systemd` from the Breeze setup directory.
+
+### Option 3: Self-Hosted Manual Docker
 
 Requires [Docker](https://docs.docker.com/get-docker/) and Docker Compose.
 
