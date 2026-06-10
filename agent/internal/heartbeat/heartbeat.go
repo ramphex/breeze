@@ -360,6 +360,8 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 	if runtime.GOOS == "windows" && cfg.IsService {
 		h.helperMgr = helper.New(helperCtx, cfg.ServerURL, ftToken, cfg.AgentID,
 			helper.WithSessionEnumerator(helper.NewPlatformEnumerator()),
+			helper.WithAgentVersion(version),
+			helper.WithManifestKeys(cfg.PinnedManifestPubKeys),
 			helper.WithSpawnFunc(func(sessionKey, binaryPath string, args ...string) (int, error) {
 				// Try launching via connected user-role helper first (runs as
 				// the logged-in user, so the Tauri app inherits user identity).
@@ -384,6 +386,8 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 		// IPC helper (LaunchAgent) so the Tauri app runs in the user session.
 		h.helperMgr = helper.New(helperCtx, cfg.ServerURL, ftToken, cfg.AgentID,
 			helper.WithSessionEnumerator(helper.NewPlatformEnumerator()),
+			helper.WithAgentVersion(version),
+			helper.WithManifestKeys(cfg.PinnedManifestPubKeys),
 			helper.WithSpawnFunc(func(sessionKey, binaryPath string, args ...string) (int, error) {
 				if err := h.sessionBroker.LaunchProcessViaUserHelperForSession(sessionKey, binaryPath, args...); err == nil {
 					return 0, nil // PID unknown when launched via IPC; refreshPID will reconcile
@@ -394,6 +398,8 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 	} else {
 		h.helperMgr = helper.New(helperCtx, cfg.ServerURL, ftToken, cfg.AgentID,
 			helper.WithSessionEnumerator(helper.NewPlatformEnumerator()),
+			helper.WithAgentVersion(version),
+			helper.WithManifestKeys(cfg.PinnedManifestPubKeys),
 		)
 	}
 
@@ -2315,7 +2321,19 @@ func (h *Heartbeat) sendHeartbeat() {
 
 	// Handle helper upgrade if requested
 	if response.HelperUpgradeTo != "" {
-		h.helperMgr.CheckUpdate(response.HelperUpgradeTo)
+		installedHelper := h.helperMgr.InstalledVersion()
+		if allowed, reason := helperUpgradeAllowed(response.HelperUpgradeTo, installedHelper); !allowed {
+			// SECURITY: never auto-downgrade the helper. The signed manifest
+			// only binds manifest.Release == requested version, so a
+			// compromised/MITM'd control plane could replay an older,
+			// validly-signed, known-vulnerable helper release.
+			log.Error("SECURITY: refusing server-directed helper update",
+				"installedVersion", installedHelper,
+				"targetVersion", response.HelperUpgradeTo,
+				"reason", reason)
+		} else {
+			h.helperMgr.CheckUpdate(response.HelperUpgradeTo)
+		}
 	}
 
 	// Update tunnel manager policy flag
