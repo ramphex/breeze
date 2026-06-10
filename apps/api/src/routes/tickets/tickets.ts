@@ -17,6 +17,8 @@ import {
 } from '../../services/ticketService';
 import type { AuthContext } from '../../middleware/auth';
 
+// NOTE: authMiddleware is applied by the hub router in ./index.ts (alerts pattern) —
+// requireScope/requirePermission below depend on c.get('auth') being populated there.
 export const ticketsRoutes = new Hono();
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -162,6 +164,7 @@ ticketsRoutes.get(
       conditions.push(eq(tickets.partnerId, auth.partnerId));
     }
     if (q.orgId) conditions.push(eq(tickets.orgId, q.orgId));
+    if (q.deviceId) conditions.push(eq(tickets.deviceId, q.deviceId));
     if (q.status) conditions.push(eq(tickets.status, q.status));
     else if (q.statusGroup === 'open') conditions.push(inArray(tickets.status, [...OPEN_STATUSES]));
     else if (q.statusGroup === 'closed') conditions.push(inArray(tickets.status, [...CLOSED_STATUSES]));
@@ -203,6 +206,7 @@ ticketsRoutes.get(
         dueDate: tickets.dueDate,
         slaBreachedAt: tickets.slaBreachedAt,
         firstResponseAt: tickets.firstResponseAt,
+        resolutionSlaMinutes: tickets.resolutionSlaMinutes,
         createdAt: tickets.createdAt,
         updatedAt: tickets.updatedAt
       })
@@ -265,6 +269,23 @@ ticketsRoutes.get(
     const ticket = await getScopedTicketOr404(auth, id);
     if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
 
+    // Decorate with display names for the workbench breadcrumb / assignee chip.
+    // Mirrors the list endpoint's join column choices; left joins keep missing
+    // device/assignee as null. Strictly additive on top of the raw ticket row.
+    const decorationRows = await db
+      .select({
+        orgName: organizations.name,
+        deviceHostname: devices.hostname,
+        assigneeName: users.name
+      })
+      .from(tickets)
+      .leftJoin(organizations, eq(tickets.orgId, organizations.id))
+      .leftJoin(devices, eq(tickets.deviceId, devices.id))
+      .leftJoin(users, eq(tickets.assignedTo, users.id))
+      .where(eq(tickets.id, ticket.id))
+      .limit(1);
+    const { orgName = null, deviceHostname = null, assigneeName = null } = decorationRows[0] ?? {};
+
     const comments = await db
       .select()
       .from(ticketComments)
@@ -284,7 +305,7 @@ ticketsRoutes.get(
       .leftJoin(alerts, eq(ticketAlertLinks.alertId, alerts.id))
       .where(eq(ticketAlertLinks.ticketId, id));
 
-    return c.json({ data: { ...ticket, comments, alertLinks } });
+    return c.json({ data: { ...ticket, orgName, deviceHostname, assigneeName, comments, alertLinks } });
   }
 );
 

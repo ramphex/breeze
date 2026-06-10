@@ -35,9 +35,22 @@ vi.mock('../../services/ticketService', async () => {
   return { ...actual, ...serviceMocks };
 });
 
+// Mirror the REAL middleware contract: authMiddleware is the ONLY thing that
+// populates c.get('auth'); requireScope 401s when it is missing (exactly the
+// production failure mode when authMiddleware isn't wired into the router —
+// regression for the Phase 1a routes shipping without it).
 vi.mock('../../middleware/auth', () => ({
-  requireScope: () => async (c: any, next: any) => {
+  authMiddleware: vi.fn(async (c: any, next: any) => {
+    if (!authRef.current) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
     c.set('auth', authRef.current);
+    await next();
+  }),
+  requireScope: () => async (c: any, next: any) => {
+    if (!c.get('auth')) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
     await next();
   },
   requirePermission: () => async (_c: any, next: any) => next()
@@ -51,12 +64,14 @@ vi.mock('../../db', () => ({
           leftJoin: vi.fn(() => ({
             leftJoin: vi.fn(() => ({
               // 3 leftJoins: list endpoint (tickets + orgs + devices + users)
+              // and the GET /:id decoration query (where → limit(1))
               where: vi.fn((...args: unknown[]) => {
                 lastWhereArgs.push({ conditions: args });
                 return {
                   orderBy: vi.fn(() => ({
                     limit: vi.fn(() => ({ offset: vi.fn(() => dbSelectMock()) }))
-                  }))
+                  })),
+                  limit: vi.fn(() => dbSelectMock())
                 };
               })
             })),
@@ -90,7 +105,8 @@ vi.mock('../../db/schema', () => ({
     priority: 'priority', assignedTo: 'assignedTo', categoryId: 'categoryId',
     internalNumber: 'internalNumber', subject: 'subject', createdAt: 'createdAt',
     updatedAt: 'updatedAt', dueDate: 'dueDate', deviceId: 'deviceId',
-    source: 'source', slaBreachedAt: 'slaBreachedAt', firstResponseAt: 'firstResponseAt'
+    source: 'source', slaBreachedAt: 'slaBreachedAt', firstResponseAt: 'firstResponseAt',
+    resolutionSlaMinutes: 'resolutionSlaMinutes'
   },
   ticketComments: { ticketId: 'ticketId', deletedAt: 'deletedAt', createdAt: 'createdAt' },
   ticketCategories: {},
@@ -101,7 +117,9 @@ vi.mock('../../db/schema', () => ({
   users: { id: 'id', name: 'name' }
 }));
 
-import { ticketsRoutes } from './tickets';
+// Import the hub router (./index), not ./tickets directly — the hub is what
+// apps/api/src/index.ts mounts and is where authMiddleware is applied.
+import { ticketsRoutes } from './index';
 
 const TICKET_ID = '3f2f1d8e-1111-4222-8333-444455556666';
 const ORG_ID    = '3f2f1d8e-1111-4222-8333-444455556666';
@@ -140,6 +158,26 @@ describe('GET /tickets', () => {
     expect(body).toHaveProperty('pagination');
   });
 
+  it('selects resolutionSlaMinutes and returns it in list rows (SLA chips)', async () => {
+    dbSelectMock.mockResolvedValue([
+      { id: 't-1', internalNumber: 'T-2026-0001', subject: 'Printer', resolutionSlaMinutes: 240 }
+    ]);
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data[0]).toMatchObject({ resolutionSlaMinutes: 240 });
+
+    // The selection object passed to db.select must include the column —
+    // the mock returns rows verbatim, so assert the query shape too.
+    const { db } = await import('../../db');
+    const selectionCalls = (db.select as any).mock.calls.filter(
+      (args: unknown[]) => args[0] && typeof args[0] === 'object'
+    );
+    expect(selectionCalls.some(
+      (args: any[]) => 'resolutionSlaMinutes' in args[0]
+    )).toBe(true);
+  });
+
   it('rejects an invalid statusGroup', async () => {
     const res = await makeApp().request('/tickets?statusGroup=weird');
     expect(res.status).toBe(400);
@@ -175,6 +213,25 @@ describe('GET /tickets', () => {
     expect(res.status).toBe(403);
     const body = await res.json();
     expect(body).toHaveProperty('error', 'Organization context required');
+  });
+
+  it('applies a deviceId filter condition when ?deviceId= is provided', async () => {
+    const DEVICE_ID = '9a8b7c6d-1111-4222-8333-444455556666';
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request(`/tickets?deviceId=${DEVICE_ID}`);
+    expect(res.status).toBe(200);
+    // The where condition is and(partnerCond, eq(tickets.deviceId, DEVICE_ID));
+    // the mocked schema column is the string 'deviceId', so the serialized SQL
+    // must mention both the column and the bound uuid value.
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('deviceId');
+    expect(serialized).toContain(DEVICE_ID);
+  });
+
+  it('rejects a non-uuid deviceId', async () => {
+    const res = await makeApp().request('/tickets?deviceId=not-a-uuid');
+    expect(res.status).toBe(400);
   });
 });
 
@@ -279,15 +336,63 @@ describe('GET /tickets/:id — scoped pre-check', () => {
 
   it('returns the ticket when the scoped lookup resolves a row', async () => {
     // First call: getScopedTicketOr404 (the .limit(1) select)
-    // Second call onwards: child queries (comments, alertLinks) — return empty arrays
+    // Second call onwards: decoration + child queries (alertLinks) — return empty arrays
     dbSelectMock
       .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
-      .mockResolvedValue([]);               // comments + alert links child queries
+      .mockResolvedValue([]);               // decoration + alert links child queries
 
     const res = await makeApp().request(`/tickets/${TICKET_ID}`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data).toMatchObject({ id: TICKET_ID, subject: 'Printer' });
+  });
+
+  it('decorates the detail response with orgName, deviceHostname, assigneeName', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValueOnce([{ orgName: 'Acme Corp', deviceHostname: 'WS-042', assigneeName: 'Tess Tech' }]) // decoration query
+      .mockResolvedValue([]);               // alert links child query
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Strictly additive: raw row fields still present alongside the decoration.
+    expect(body.data).toMatchObject({
+      id: TICKET_ID,
+      subject: 'Printer',
+      orgName: 'Acme Corp',
+      deviceHostname: 'WS-042',
+      assigneeName: 'Tess Tech'
+    });
+    expect(body.data).toHaveProperty('comments');
+    expect(body.data).toHaveProperty('alertLinks');
+  });
+
+  it('decoration is null-safe for tickets with no device or assignee', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValueOnce([{ orgName: 'Acme Corp', deviceHostname: null, assigneeName: null }]) // left joins miss
+      .mockResolvedValue([]);               // alert links child query
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.orgName).toBe('Acme Corp');
+    expect(body.data.deviceHostname).toBeNull();
+    expect(body.data.assigneeName).toBeNull();
+  });
+
+  it('decoration falls back to nulls when the decoration query returns no row', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValue([]);               // decoration returns nothing + alert links
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.orgName).toBeNull();
+    expect(body.data.deviceHostname).toBeNull();
+    expect(body.data.assigneeName).toBeNull();
   });
 });
 
@@ -595,5 +700,35 @@ describe('PATCH /tickets/:id — scoped update', () => {
       // No scoped-ticket/device selects were consumed
       expect(dbSelectMock).not.toHaveBeenCalled();
     });
+  });
+});
+
+// Regression: Phase 1a shipped these routes WITHOUT authMiddleware in the chain,
+// so over real HTTP every request 401'd ("Not authenticated") — requireScope
+// found no c.get('auth'). The old test mock had requireScope inject the auth
+// context itself, masking the missing middleware. This block proves the
+// middleware is actually wired: it must run (call count) and must be the thing
+// that rejects unauthenticated requests.
+describe('authMiddleware wiring', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('GET /tickets returns 401 Not authenticated when unauthenticated, via authMiddleware', async () => {
+    authRef.current = null as unknown as typeof authRef.current;
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Not authenticated');
+
+    // The middleware itself must be in the chain (not some other 401 source)
+    const { authMiddleware } = await import('../../middleware/auth');
+    expect(authMiddleware).toHaveBeenCalledTimes(1);
+  });
+
+  it('authMiddleware runs on authenticated requests too', async () => {
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    const { authMiddleware } = await import('../../middleware/auth');
+    expect(authMiddleware).toHaveBeenCalledTimes(1);
   });
 });
