@@ -23,6 +23,17 @@ const SKIP_REASON_LABELS: Record<string, string> = {
 };
 
 type Tab = 'mine' | 'unassigned' | 'open' | 'breaching' | 'closed';
+type TicketSort = 'triage' | 'newest' | 'oldest' | 'due';
+
+const SORT_OPTIONS: Array<{ value: TicketSort; label: string }> = [
+  { value: 'triage', label: 'Triage order' },
+  { value: 'newest', label: 'Newest first' },
+  { value: 'oldest', label: 'Oldest first' },
+  { value: 'due', label: 'Due date' }
+];
+
+const isTicketSort = (value: string): value is TicketSort =>
+  SORT_OPTIONS.some((o) => o.value === value);
 
 const PRIORITY_ORDER: TicketPriority[] = ['low', 'normal', 'high', 'urgent'];
 
@@ -50,9 +61,31 @@ function tabQuery(tab: Tab): string {
   }
 }
 
-function selectionFromHash(): string | null {
-  if (typeof window === 'undefined') return null;
-  return window.location.hash.replace('#', '') || null;
+// Hash layout (hash-based UI state per CLAUDE.md): `#<selection>&sort=<sort>`.
+// The bare segment is the selected ticket key (internal number or id); the
+// `sort=` segment carries the queue sort. Both are optional, and the default
+// sort ('triage') is omitted so plain `#T-2026-0001` hashes keep working.
+function parseHash(): { selection: string | null; sort: TicketSort } {
+  if (typeof window === 'undefined') return { selection: null, sort: 'triage' };
+  let selection: string | null = null;
+  let sort: TicketSort = 'triage';
+  for (const part of window.location.hash.replace('#', '').split('&')) {
+    if (!part) continue;
+    if (part.startsWith('sort=')) {
+      const value = part.slice('sort='.length);
+      if (isTicketSort(value)) sort = value;
+    } else {
+      selection = part;
+    }
+  }
+  return { selection, sort };
+}
+
+function hashFor(selection: string | null, sort: TicketSort): string {
+  const parts: string[] = [];
+  if (selection) parts.push(selection);
+  if (sort !== 'triage') parts.push(`sort=${sort}`);
+  return parts.length > 0 ? `#${parts.join('&')}` : '';
 }
 
 export default function TicketsPage() {
@@ -70,7 +103,8 @@ export default function TicketsPage() {
   const [stats, setStats] = useState<{ open: number; unassigned: number; mine: number; breached: number; atRisk?: number } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
-  const [selectedNumber, setSelectedNumber] = useState<string | null>(selectionFromHash);
+  const [selectedNumber, setSelectedNumber] = useState<string | null>(() => parseHash().selection);
+  const [sort, setSort] = useState<TicketSort>(() => parseHash().sort);
   const [search, setSearch] = useState('');
   const [orgFilter, setOrgFilter] = useState('');
   const [priorityFilter, setPriorityFilter] = useState('');
@@ -145,6 +179,9 @@ export default function TicketsPage() {
       if (categoryFilter) params.set('categoryId', categoryFilter);
       // The 'mine'/'unassigned' tabs already set assignee; the filter applies only on the other tabs.
       if (assigneeFilter && tab !== 'mine' && tab !== 'unassigned') params.set('assignee', assigneeFilter);
+      // 'triage' is the server default, so it's omitted — which also lets the
+      // closed tab keep its tabQuery() sort=newest until the user picks a sort.
+      if (sort !== 'triage') params.set('sort', sort);
       params.set('limit', '100');
       const res = await fetchWithAuth(`/tickets?${params.toString()}`);
       if (!res.ok) {
@@ -160,7 +197,7 @@ export default function TicketsPage() {
     } finally {
       if (seq === fetchSeq.current) setLoading(false);
     }
-  }, [tab, search, orgFilter, priorityFilter, categoryFilter, assigneeFilter]);
+  }, [tab, search, orgFilter, priorityFilter, categoryFilter, assigneeFilter, sort]);
 
   const fetchStats = useCallback(async () => {
     try {
@@ -176,17 +213,28 @@ export default function TicketsPage() {
 
   useEffect(() => { void fetchTickets(); void fetchStats(); }, [fetchTickets, fetchStats]);
 
-  // Selection is per-view: switching tab or changing any filter/search clears it.
+  // Selection survives tab switches (POST /tickets/bulk takes raw ids; the bar's
+  // count chip reports off-view rows) but clears when a filter or the search
+  // changes — those genuinely change what the result set means.
   useEffect(() => {
     setBulkSelectedIds(new Set());
     setBulkAssignee('');
     setBulkStatus('');
-  }, [tab, search, orgFilter, priorityFilter, categoryFilter, assigneeFilter]);
+  }, [search, orgFilter, priorityFilter, categoryFilter, assigneeFilter]);
 
   useEffect(() => {
-    const onHash = () => setSelectedNumber(selectionFromHash());
+    const onHash = () => {
+      const parsed = parseHash();
+      setSelectedNumber(parsed.selection);
+      setSort(parsed.sort);
+    };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  // Single writer for the hash so selection and sort never clobber each other.
+  const writeHash = useCallback((selection: string | null, sortValue: TicketSort) => {
+    history.replaceState(null, '', hashFor(selection, sortValue) || window.location.pathname + window.location.search);
   }, []);
 
   const selected = useMemo(
@@ -199,10 +247,10 @@ export default function TicketsPage() {
     if (!loading && tickets.length > 0 && !selected) {
       const first = tickets[0];
       const key = first.internalNumber ?? first.id;
-      history.replaceState(null, '', `#${key}`);
+      writeHash(key, sort);
       setSelectedNumber(key);
     }
-  }, [loading, tickets, selected]);
+  }, [loading, tickets, selected, sort, writeHash]);
 
   const select = useCallback((t: TicketSummary) => {
     // Below the split-pane breakpoint the workbench pane is hidden; navigate
@@ -212,9 +260,9 @@ export default function TicketsPage() {
       return;
     }
     const key = t.internalNumber ?? t.id;
-    history.replaceState(null, '', `#${key}`);
+    writeHash(key, sort);
     setSelectedNumber(key);
-  }, []);
+  }, [sort, writeHash]);
 
   const move = useCallback((delta: 1 | -1) => {
     if (tickets.length === 0) return;
@@ -424,6 +472,22 @@ export default function TicketsPage() {
             ))}
           </select>
         )}
+        <select
+          value={sort}
+          onChange={(e) => {
+            const value = e.target.value;
+            if (!isTicketSort(value)) return;
+            setSort(value);
+            writeHash(selectedNumber, value);
+          }}
+          aria-label="Sort tickets"
+          data-testid="ticket-sort"
+          className={filterSelectClass(sort !== 'triage')}
+        >
+          {SORT_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
       </div>
 
       {trueEmpty ? (
@@ -447,6 +511,16 @@ export default function TicketsPage() {
       ) : (
         <div className="flex min-h-0 flex-1 overflow-hidden rounded-lg border">
           <div className="relative flex w-full flex-col min-[1100px]:w-2/5 min-[1100px]:min-w-[320px] min-[1100px]:max-w-[480px] min-[1100px]:border-r">
+            <div className="flex items-center gap-2 border-b px-3 py-1.5">
+              <button
+                type="button"
+                onClick={() => setBulkSelectedIds((prev) => new Set([...prev, ...tickets.map((t) => t.id)]))}
+                data-testid="tickets-select-all-header"
+                className="text-xs text-muted-foreground hover:text-foreground hover:underline"
+              >
+                Select all
+              </button>
+            </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
               <TicketQueueList
                 tickets={tickets}
@@ -469,7 +543,8 @@ export default function TicketsPage() {
                   <span className="text-sm font-medium tabular-nums">{bulkSelectedIds.size} selected</span>
                   <button
                     type="button"
-                    onClick={() => setBulkSelectedIds(new Set(tickets.map((t) => t.id)))}
+                    // Union, not replace: cross-tab selections off-view must survive.
+                    onClick={() => setBulkSelectedIds((prev) => new Set([...prev, ...tickets.map((t) => t.id)]))}
                     data-testid="tickets-bulk-select-all"
                     className="text-sm text-primary hover:underline"
                   >

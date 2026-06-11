@@ -275,6 +275,51 @@ describe('TicketsPage', () => {
     expect(screen.getByTestId('tickets-filter-assignee')).toHaveAttribute('title', 'Tab already filters by assignee');
   });
 
+  describe('queue sort control', () => {
+    it('sort select passes sort=newest to the API and persists in the location hash', async () => {
+      mockListApi([healthy, atRisk, breached]);
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-healthy');
+      // Auto-select writes the selection hash first; sort must coexist with it.
+      await waitFor(() => {
+        expect(window.location.hash).toContain('T-2026-0001');
+      });
+
+      fireEvent.change(screen.getByTestId('ticket-sort'), { target: { value: 'newest' } });
+
+      await waitFor(() => {
+        expect(ticketFetchUrls().at(-1)).toContain('sort=newest');
+      });
+      expect(window.location.hash).toContain('sort=newest');
+      expect(window.location.hash).toContain('T-2026-0001');
+    });
+
+    it('restores sort and selection from a combined hash on load', async () => {
+      window.location.hash = '#T-2026-0002&sort=oldest';
+      mockListApi([healthy, atRisk, breached]);
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-risk');
+
+      expect(ticketFetchUrls().at(0)).toContain('sort=oldest');
+      expect(screen.getByTestId('ticket-sort')).toHaveValue('oldest');
+      await waitFor(() => {
+        expect(screen.getByTestId('ticket-row-tk-risk')).toHaveAttribute('aria-selected', 'true');
+      });
+    });
+
+    it('defaults to triage and omits the sort param (server default order)', async () => {
+      mockListApi([healthy]);
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-healthy');
+
+      expect(screen.getByTestId('ticket-sort')).toHaveValue('triage');
+      expect(ticketFetchUrls().at(0)).not.toContain('sort=');
+    });
+  });
+
   describe('bulk selection', () => {
     it('selecting two rows shows the bulk bar with "2 selected" without changing the workbench selection', async () => {
       mockListApi([healthy, atRisk, breached]);
@@ -344,7 +389,28 @@ describe('TicketsPage', () => {
       });
     });
 
-    it('switching tabs clears the selection and hides the bulk bar', async () => {
+    it('keeps selections when switching tabs (count includes off-view rows)', async () => {
+      // The unassigned tab returns a list that excludes both selected rows —
+      // the selection (and its count) must survive anyway: POST /tickets/bulk
+      // takes raw ids and doesn't care about tabs.
+      mockListApi((url) => (url.includes('assignee=unassigned') ? [breached] : [healthy, atRisk, breached]));
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-healthy');
+      fireEvent.click(screen.getByTestId('ticket-select-tk-healthy'));
+      fireEvent.click(screen.getByTestId('ticket-select-tk-risk'));
+      expect(screen.getByTestId('tickets-bulk-bar')).toHaveTextContent('2 selected');
+
+      fireEvent.click(screen.getByTestId('tickets-tab-unassigned'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('ticket-row-tk-healthy')).toBeNull();
+      });
+      // Both selected rows are off-view now; the bar still reports them.
+      expect(screen.getByTestId('tickets-bulk-bar')).toHaveTextContent('2 selected');
+    });
+
+    it('clears selections when filters change', async () => {
       mockListApi([healthy, atRisk, breached]);
       render(<TicketsPage />);
 
@@ -352,11 +418,47 @@ describe('TicketsPage', () => {
       fireEvent.click(screen.getByTestId('ticket-select-tk-healthy'));
       expect(screen.getByTestId('tickets-bulk-bar')).toBeInTheDocument();
 
-      fireEvent.click(screen.getByTestId('tickets-tab-unassigned'));
+      fireEvent.change(screen.getByTestId('tickets-filter-priority'), { target: { value: 'high' } });
 
       await waitFor(() => {
         expect(screen.queryByTestId('tickets-bulk-bar')).toBeNull();
       });
+    });
+
+    it('Clear empties a cross-tab selection spanning hidden rows', async () => {
+      mockListApi((url) => (url.includes('assignee=unassigned') ? [breached] : [healthy, atRisk, breached]));
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-healthy');
+      fireEvent.click(screen.getByTestId('ticket-select-tk-healthy'));
+      fireEvent.click(screen.getByTestId('ticket-select-tk-risk'));
+
+      fireEvent.click(screen.getByTestId('tickets-tab-unassigned'));
+      await waitFor(() => {
+        expect(screen.queryByTestId('ticket-row-tk-healthy')).toBeNull();
+      });
+      expect(screen.getByTestId('tickets-bulk-bar')).toHaveTextContent('2 selected');
+
+      fireEvent.click(screen.getByTestId('tickets-bulk-clear'));
+      await waitFor(() => {
+        expect(screen.queryByTestId('tickets-bulk-bar')).toBeNull();
+      });
+    });
+
+    it('Select all adds the visible rows without dropping off-view selections', async () => {
+      mockListApi((url) => (url.includes('assignee=unassigned') ? [breached] : [healthy, atRisk]));
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-healthy');
+      fireEvent.click(screen.getByTestId('ticket-select-tk-healthy'));
+      fireEvent.click(screen.getByTestId('ticket-select-tk-risk'));
+
+      fireEvent.click(screen.getByTestId('tickets-tab-unassigned'));
+      await screen.findByTestId('ticket-row-tk-breach');
+
+      fireEvent.click(screen.getByTestId('tickets-bulk-select-all'));
+      // 2 off-view (open tab) + 1 visible = 3, not a replace-with-visible.
+      expect(screen.getByTestId('tickets-bulk-bar')).toHaveTextContent('3 selected');
     });
 
     it('Clear empties the selection; Select all selects every visible row', async () => {
@@ -373,6 +475,24 @@ describe('TicketsPage', () => {
       await waitFor(() => {
         expect(screen.queryByTestId('tickets-bulk-bar')).toBeNull();
       });
+    });
+
+    it('header select-all is reachable with zero selections and selects all visible rows', async () => {
+      mockListApi([healthy, atRisk, breached]);
+      render(<TicketsPage />);
+
+      await screen.findByTestId('ticket-row-tk-healthy');
+      // Confirm no bulk bar at zero selections.
+      expect(screen.queryByTestId('tickets-bulk-bar')).toBeNull();
+
+      // The header affordance must be present without any prior selection.
+      const headerSelectAll = screen.getByTestId('tickets-select-all-header');
+      expect(headerSelectAll).toBeInTheDocument();
+
+      fireEvent.click(headerSelectAll);
+
+      // All 3 visible rows should be selected and the bulk bar shows the count.
+      expect(screen.getByTestId('tickets-bulk-bar')).toHaveTextContent('3 selected');
     });
   });
 
