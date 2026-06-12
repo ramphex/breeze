@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-REMOTE_BASE="${BREEZE_SETUP_REMOTE_BASE:-https://raw.githubusercontent.com/LanternOps/breeze/main}"
+REMOTE_BASE_OVERRIDE="${BREEZE_SETUP_REMOTE_BASE:-}"
+REMOTE_BASE="${REMOTE_BASE_OVERRIDE}"
 WORK_DIR="${BREEZE_SETUP_DIR:-$(pwd)}"
 ENV_FILE=""
 ENV_FILE_CREATED="false"
@@ -38,7 +37,13 @@ PROXY_BIND_HOST="${BREEZE_SETUP_PROXY_BIND_HOST:-127.0.0.1}"
 PROXY_TARGET_HOST="${BREEZE_SETUP_PROXY_TARGET_HOST:-}"
 API_HOST_PORT="${BREEZE_SETUP_API_HOST_PORT:-3001}"
 WEB_HOST_PORT="${BREEZE_SETUP_WEB_HOST_PORT:-4321}"
+SELECTED_BREEZE_VERSION=""
 BACK_STATUS=42
+BOOTSTRAP_ENV_KEYS=(
+  BREEZE_BOOTSTRAP_ADMIN_EMAIL
+  BREEZE_BOOTSTRAP_ADMIN_PASSWORD
+  BREEZE_BOOTSTRAP_ADMIN_NAME
+)
 
 if [[ -t 1 ]]; then
   C_OK=$'\033[32m'
@@ -76,7 +81,7 @@ Options:
   -h, --help           Show this help.
 
 Environment overrides:
-  BREEZE_SETUP_REMOTE_BASE   Raw GitHub base URL for templates.
+  BREEZE_SETUP_REMOTE_BASE   Override raw GitHub base URL for template testing.
   BREEZE_SETUP_GITHUB_REPO   GitHub repo for latest release lookup.
   BREEZE_SETUP_SECRET_MODE   Secret workflow: auto or manual.
   BREEZE_SETUP_STORAGE_MODE  Storage mode: docker or local.
@@ -198,6 +203,30 @@ dry_run_log() {
   log "[dry-run] $*"
 }
 
+read_prompt() {
+  local __var_name="$1"
+  local prompt="$2"
+
+  [[ "${__var_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "Invalid prompt variable name: ${__var_name}"
+  if [[ -t 0 ]]; then
+    read -r -e -p "${prompt}" "${__var_name?}"
+  else
+    read -r -p "${prompt}" "${__var_name?}"
+  fi
+}
+
+read_secret_prompt() {
+  local __var_name="$1"
+  local prompt="$2"
+
+  [[ "${__var_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "Invalid prompt variable name: ${__var_name}"
+  if [[ -t 0 ]]; then
+    read -r -s -e -p "${prompt}" "${__var_name?}"
+  else
+    read -r -s -p "${prompt}" "${__var_name?}"
+  fi
+}
+
 ask_yes_no() {
   local prompt="$1"
   local default_answer="$2"
@@ -215,7 +244,7 @@ ask_yes_no() {
   fi
 
   while true; do
-    if ! read -r -p "${prompt} ${suffix} " answer; then
+    if ! read_prompt answer "${prompt} ${suffix} "; then
       fail "No input received for prompt: ${prompt}"
     fi
     answer="${answer:-${default_answer}}"
@@ -268,7 +297,7 @@ select_secret_mode() {
   log "  1) auto   Generate missing/example passwords and secrets"
   log "  2) manual Prompt for each password and secret"
   while true; do
-    if ! read -r -p "Secret setup mode [1]: " choice; then
+    if ! read_prompt choice "Secret setup mode [1]: "; then
       fail "No input received for secret workflow."
     fi
     choice="${choice:-1}"
@@ -464,7 +493,7 @@ check_proxy_port_conflicts() {
   fi
 }
 
-backup_file() {
+backup_path_for() {
   local file="$1"
   local stamp backup suffix
   stamp="$(date +%Y%m%d%H%M%S)"
@@ -474,6 +503,13 @@ backup_file() {
     backup="${file}.bak.${stamp}.${suffix}"
     suffix=$((suffix + 1))
   done
+  printf '%s' "${backup}"
+}
+
+backup_file() {
+  local file="$1"
+  local backup
+  backup="$(backup_path_for "${file}")"
   cp "${file}" "${backup}"
   log "Backed up ${file} to ${backup}"
 }
@@ -481,27 +517,41 @@ backup_file() {
 download_template() {
   local name="$1"
   local target="${WORK_DIR}/${name}"
-  local tmp="${target}.tmp.$$"
+  local tmp
+  local url
+
+  [[ -n "${REMOTE_BASE}" ]] || fail "Template remote base is not configured."
 
   if [[ -e "${target}" && ! -f "${target}" ]]; then
     fail "${target} exists but is not a regular file. Remove or rename it before downloading templates."
   fi
 
   mkdir -p "$(dirname "${target}")"
+  tmp="$(mktemp "${target}.tmp.XXXXXX")"
 
   if [[ -f "${target}" ]]; then
     backup_file "${target}"
   fi
 
-  log "Downloading ${name} from ${REMOTE_BASE}/${name}"
-  curl -fsSL "${REMOTE_BASE}/${name}" -o "${tmp}"
-  mv "${tmp}" "${target}"
+  url="${REMOTE_BASE}/${name}"
+  log "Downloading ${name} from ${url}"
+  if ! curl -fsSL "${url}" -o "${tmp}"; then
+    rm -f "${tmp}"
+    fail "Failed to download ${name} from ${url}. Check that the selected Breeze release includes this template."
+  fi
+  if ! mv "${tmp}" "${target}"; then
+    rm -f "${tmp}"
+    fail "Failed to install downloaded ${name} at ${target}."
+  fi
 }
 
 prepare_templates() {
   section "Templates"
 
   local need_download="false"
+  if [[ -n "${REMOTE_BASE}" ]]; then
+    log "Template source: ${REMOTE_BASE}"
+  fi
   if [[ ! -f "${COMPOSE_FILE}" || ! -f "${ENV_EXAMPLE_FILE}" ]]; then
     need_download="true"
   fi
@@ -581,6 +631,10 @@ shell_quote() {
   printf "'%s'" "${value}"
 }
 
+bash_source_quote() {
+  printf '%q' "$1"
+}
+
 systemd_available() {
   [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 1
   command -v systemctl >/dev/null 2>&1 || return 1
@@ -602,13 +656,16 @@ run_privileged() {
 }
 
 write_boot_helper() {
-  local compose_args helper_dir helper_tmp
+  local compose_array file helper_dir helper_tmp
 
-  compose_args=""
+  compose_array=$'compose=(\n  docker\n  compose\n'
   for file in "${COMPOSE_FILES[@]}"; do
-    compose_args+=" -f $(shell_quote "${file}")"
+    compose_array+=$'  -f\n'
+    compose_array+="  $(bash_source_quote "${file}")"$'\n'
   done
-  compose_args+=" --env-file $(shell_quote "${ENV_FILE}")"
+  compose_array+=$'  --env-file\n'
+  compose_array+="  $(bash_source_quote "${ENV_FILE}")"$'\n'
+  compose_array+=')'
 
   helper_dir="${SYSTEMD_HELPER_FILE%/*}"
   helper_tmp="$(mktemp)"
@@ -616,7 +673,7 @@ write_boot_helper() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-compose=(docker compose${compose_args})
+${compose_array}
 up=("\${compose[@]}" up -d --pull never)
 
 wait_for_docker() {
@@ -632,13 +689,20 @@ service_exists() {
 }
 
 start_remaining_services() {
-  local service
+  local service services
+
+  if ! services="\$("\${compose[@]}" config --services)"; then
+    echo "Failed to read Compose services from docker compose config --services." >&2
+    return 1
+  fi
+
   while IFS= read -r service; do
+    [[ -n "\${service}" ]] || continue
     case "\${service}" in
       postgres|redis|binaries-init|api|web|caddy) continue ;;
     esac
     "\${up[@]}" "\${service}"
-  done < <("\${compose[@]}" config --services)
+  done <<< "\${services}"
 }
 
 case "\${1:-up}" in
@@ -800,6 +864,45 @@ remove_generated_proxy_override_if_present() {
   log "Removed legacy external-proxy Compose override. ${COMPOSE_FILE} is now generated as the runnable Compose file."
 }
 
+fail_compose_rewrite() {
+  local generated_file="$1"
+  shift
+  rm -f "${generated_file}"
+  fail "$*"
+}
+
+assert_generated_compose_contains() {
+  local generated_file="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! grep -Fq -- "${expected}" "${generated_file}"; then
+    fail_compose_rewrite "${generated_file}" "Generated Compose file is missing ${description}; ${COMPOSE_FILE} was left unchanged."
+  fi
+}
+
+assert_generated_compose_absent_regex() {
+  local generated_file="$1"
+  local unexpected_regex="$2"
+  local description="$3"
+
+  if grep -Eq -- "${unexpected_regex}" "${generated_file}"; then
+    fail_compose_rewrite "${generated_file}" "Generated Compose file still contains ${description}; ${COMPOSE_FILE} was left unchanged."
+  fi
+}
+
+assert_external_proxy_compose_rewrite() {
+  local generated_file="$1"
+
+  [[ -s "${generated_file}" ]] || fail_compose_rewrite "${generated_file}" "Generated external-proxy Compose file was empty; ${COMPOSE_FILE} was left unchanged."
+  assert_generated_compose_absent_regex "${generated_file}" '^  caddy:[[:space:]]*$' "the packaged Caddy service"
+  assert_generated_compose_absent_regex "${generated_file}" '^  caddy_(data|config):[[:space:]]*$' "packaged Caddy volumes"
+  # shellcheck disable=SC2016
+  assert_generated_compose_contains "${generated_file}" '      - "${BREEZE_PROXY_BIND_HOST:-127.0.0.1}:${BREEZE_API_HOST_PORT:-3001}:3001"' "the API host port mapping"
+  # shellcheck disable=SC2016
+  assert_generated_compose_contains "${generated_file}" '      - "${BREEZE_PROXY_BIND_HOST:-127.0.0.1}:${BREEZE_WEB_HOST_PORT:-4321}:4321"' "the Web host port mapping"
+}
+
 write_external_proxy_compose_file() {
   local tmp
 
@@ -816,7 +919,7 @@ write_external_proxy_compose_file() {
   tmp="$(mktemp "${COMPOSE_FILE}.tmp.XXXXXX")"
   backup_file "${COMPOSE_FILE}"
 
-  awk '
+  if ! awk '
     NR == 1 {
       print "# Generated by scripts/guided-setup.sh for external reverse proxy mode."
       print "# Packaged Caddy has been removed; API/Web host ports are configured from .env."
@@ -880,9 +983,16 @@ write_external_proxy_compose_file() {
     {
       print
     }
-  ' "${COMPOSE_FILE}" > "${tmp}"
+  ' "${COMPOSE_FILE}" > "${tmp}"; then
+    rm -f "${tmp}"
+    fail "Failed to generate external-proxy Compose file; ${COMPOSE_FILE} was left unchanged."
+  fi
 
-  mv "${tmp}" "${COMPOSE_FILE}"
+  assert_external_proxy_compose_rewrite "${tmp}"
+  if ! mv "${tmp}" "${COMPOSE_FILE}"; then
+    rm -f "${tmp}"
+    fail "Failed to replace ${COMPOSE_FILE} with generated external-proxy Compose file."
+  fi
 }
 
 ensure_local_storage_dirs() {
@@ -899,6 +1009,31 @@ ensure_local_storage_dirs() {
   fi
 }
 
+assert_local_storage_compose_rewrite() {
+  local generated_file="$1"
+
+  [[ -s "${generated_file}" ]] || fail_compose_rewrite "${generated_file}" "Generated local-storage Compose file was empty; ${COMPOSE_FILE} was left unchanged."
+
+  assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- binaries:/target[[:space:]]*$' "the binaries named-volume init mount"
+  assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- api_data:/data[[:space:]]*$' "the API named-volume mount"
+  assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- binaries:/data/binaries:ro[[:space:]]*$' "the API binaries named-volume mount"
+  assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- postgres_data:/var/lib/postgresql/data[[:space:]]*$' "the Postgres named-volume mount"
+  assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- redis_data:/data[[:space:]]*$' "the Redis named-volume mount"
+
+  assert_generated_compose_contains "${generated_file}" '      - ./data/binaries:/target' "the binaries init bind mount"
+  assert_generated_compose_contains "${generated_file}" '      - ./data/api:/data' "the API data bind mount"
+  assert_generated_compose_contains "${generated_file}" '      - ./data/binaries:/data/binaries:ro' "the API binaries bind mount"
+  assert_generated_compose_contains "${generated_file}" '      - ./data/postgres:/var/lib/postgresql/data' "the Postgres data bind mount"
+  assert_generated_compose_contains "${generated_file}" '      - ./data/redis:/data' "the Redis data bind mount"
+
+  if grep -Eq '^  caddy:[[:space:]]*$' "${generated_file}"; then
+    assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- caddy_data:/data[[:space:]]*$' "the Caddy data named-volume mount"
+    assert_generated_compose_absent_regex "${generated_file}" '^[[:space:]]+- caddy_config:/config[[:space:]]*$' "the Caddy config named-volume mount"
+    assert_generated_compose_contains "${generated_file}" '      - ./data/caddy/data:/data' "the Caddy data bind mount"
+    assert_generated_compose_contains "${generated_file}" '      - ./data/caddy/config:/config' "the Caddy config bind mount"
+  fi
+}
+
 write_local_storage_compose_file() {
   local tmp
 
@@ -912,7 +1047,7 @@ write_local_storage_compose_file() {
   tmp="$(mktemp "${COMPOSE_FILE}.tmp.XXXXXX")"
   backup_file "${COMPOSE_FILE}"
 
-  awk '
+  if ! awk '
     NR == 1 {
       print "# Generated by scripts/guided-setup.sh for local storage mode."
       print "# Persistent container data is stored under ./data next to this Compose file."
@@ -943,107 +1078,238 @@ write_local_storage_compose_file() {
       gsub("- redis_data:/data", "- ./data/redis:/data")
       print
     }
-  ' "${COMPOSE_FILE}" > "${tmp}"
+  ' "${COMPOSE_FILE}" > "${tmp}"; then
+    rm -f "${tmp}"
+    fail "Failed to generate local-storage Compose file; ${COMPOSE_FILE} was left unchanged."
+  fi
 
-  mv "${tmp}" "${COMPOSE_FILE}"
+  assert_local_storage_compose_rewrite "${tmp}"
+  if ! mv "${tmp}" "${COMPOSE_FILE}"; then
+    rm -f "${tmp}"
+    fail "Failed to replace ${COMPOSE_FILE} with generated local-storage Compose file."
+  fi
   log "Generated ${COMPOSE_FILE} with local ./data bind mounts."
 }
 
 print_npm_advanced_tab_config() {
   cat <<EOF
-client_max_body_size 1024m;
-proxy_http_version 1.1;
-proxy_set_header Upgrade \$http_upgrade;
-proxy_set_header Connection \$connection_upgrade;
-proxy_set_header Host \$host;
-proxy_set_header X-Real-IP \$remote_addr;
-proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto \$scheme;
-proxy_buffering off;
-proxy_request_buffering off;
+# Breeze NPM Advanced config.
+# Covers Breeze self-host API/Web traffic in NPM-safe syntax.
+# If you raise MAX_TRANSFER_SIZE_MB, raise client_max_body_size to match.
+client_max_body_size 512m;
 proxy_read_timeout 86400s;
 proxy_send_timeout 86400s;
-
-set \$breeze_api http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
-set \$breeze_web http://${PROXY_TARGET_HOST}:${WEB_HOST_PORT};
-
-location = /api {
-    proxy_pass \$breeze_api;
-}
-location ^~ /api/ {
-    proxy_pass \$breeze_api;
-}
-
-location = /s {
-    proxy_pass \$breeze_api;
-}
-location ^~ /s/ {
-    proxy_pass \$breeze_api;
-}
-
-location = /health {
-    proxy_pass \$breeze_api;
-}
-location ^~ /health/ {
-    proxy_pass \$breeze_api;
-}
-
-location = /ready {
-    proxy_pass \$breeze_api;
-}
-
-location = /metrics {
-    proxy_pass \$breeze_api;
-}
-location ^~ /metrics/ {
-    proxy_pass \$breeze_api;
-}
-
-location = /i {
-    proxy_pass \$breeze_api;
-}
-location ^~ /i/ {
-    proxy_pass \$breeze_api;
-}
+proxy_buffering off;
+proxy_request_buffering off;
 
 location = /oauth/consent {
-    proxy_pass \$breeze_web;
-}
-location ^~ /oauth/consent/ {
-    proxy_pass \$breeze_web;
-}
-location = /oauth {
-    proxy_pass \$breeze_api;
-}
-location ^~ /oauth/ {
-    proxy_pass \$breeze_api;
+    proxy_pass http://${PROXY_TARGET_HOST}:${WEB_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$http_connection;
 }
 
-location = /.well-known/oauth-authorization-server {
-    proxy_pass \$breeze_api;
-}
-location = /.well-known/oauth-protected-resource {
-    proxy_pass \$breeze_api;
-}
-location = /.well-known/jwks.json {
-    proxy_pass \$breeze_api;
+location /oauth/consent/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${WEB_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$http_connection;
 }
 
 location = /activate/complete {
-    proxy_pass \$breeze_web;
+    proxy_pass http://${PROXY_TARGET_HOST}:${WEB_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$http_connection;
 }
-location ^~ /activate/complete/ {
-    proxy_pass \$breeze_web;
+
+location /activate/complete/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${WEB_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$http_connection;
 }
+
+location = /api {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$http_connection;
+}
+
+location /api/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$http_connection;
+}
+
+location = /oauth {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location /oauth/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /.well-known/oauth-authorization-server {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /.well-known/oauth-protected-resource {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /.well-known/jwks.json {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /s {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location /s/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /i {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location /i/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /health {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location /health/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /ready {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location = /metrics {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
+location /metrics/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+
 location = /activate {
-    proxy_pass \$breeze_api;
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
 }
-location ^~ /activate/ {
-    set \$breeze_activate_upstream \$breeze_api;
-    if (\$arg_status != "") {
-        set \$breeze_activate_upstream \$breeze_web;
-    }
-    proxy_pass \$breeze_activate_upstream;
+
+location /activate/ {
+    proxy_pass http://${PROXY_TARGET_HOST}:${API_HOST_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
 }
 EOF
 }
@@ -1097,7 +1363,7 @@ Details tab:
 - Force SSL: enabled
 - HTTP/2 Support: enabled
 
-Advanced tab copy/paste. This includes the API/Web custom path routing, so you
+Advanced tab copy/paste. This includes Breeze's API/Web path routing, so you
 do not need to add separate NPM Custom Locations:
 
 \`\`\`nginx
@@ -1149,7 +1415,14 @@ EOF
   if [[ -f "${PROXY_GUIDE_FILE}" ]]; then
     backup_file "${PROXY_GUIDE_FILE}"
   fi
-  mv "${tmp}" "${PROXY_GUIDE_FILE}"
+  if [[ ! -s "${tmp}" ]]; then
+    rm -f "${tmp}"
+    fail "Generated reverse proxy guide was empty; ${PROXY_GUIDE_FILE} was left unchanged."
+  fi
+  if ! mv "${tmp}" "${PROXY_GUIDE_FILE}"; then
+    rm -f "${tmp}"
+    fail "Failed to replace ${PROXY_GUIDE_FILE} with generated reverse proxy guide."
+  fi
 }
 
 select_proxy_target_host() {
@@ -1163,7 +1436,7 @@ select_proxy_target_host() {
 
   if [[ -n "${PROXY_TARGET_HOST}" ]]; then
     while true; do
-      if ! read -r -p "Use existing reverse-proxy target host ${PROXY_TARGET_HOST}? [Y/n] or b to go back: " choice; then
+      if ! read_prompt choice "Use existing reverse-proxy target host ${PROXY_TARGET_HOST}? [Y/n] or b to go back: "; then
         fail "No input received for reverse-proxy target host reuse."
       fi
       choice="${choice:-yes}"
@@ -1202,12 +1475,12 @@ select_proxy_target_host() {
 
   while true; do
     if (( ${#ips[@]} > 0 )); then
-      if ! read -r -p "Breeze upstream selection [1]: " choice; then
+      if ! read_prompt choice "Breeze upstream selection [1]: "; then
         fail "No input received for Breeze instance IP."
       fi
       choice="${choice:-1}"
     else
-      if ! read -r -p "Breeze upstream selection [m]: " choice; then
+      if ! read_prompt choice "Breeze upstream selection [m]: "; then
         fail "No input received for Breeze instance IP."
       fi
       choice="${choice:-m}"
@@ -1222,7 +1495,7 @@ select_proxy_target_host() {
         return
         ;;
       m|M|manual)
-        if manual="$(prompt_value_or_back "BREEZE_PROXY_TARGET_HOST" "Manual Breeze instance IP or hostname for proxy upstreams" "" true "reverse proxy choice")"; then
+        if manual="$(prompt_host_or_back "BREEZE_PROXY_TARGET_HOST" "Manual Breeze instance IP or hostname for proxy upstreams" "" true "reverse proxy choice")"; then
           :
         else
           status=$?
@@ -1405,6 +1678,85 @@ validate_proxy_cidrs() {
   return 0
 }
 
+is_port_number() {
+  local value="$1"
+
+  [[ "${value}" =~ ^[0-9]+$ ]] || return 1
+  (( 10#${value} >= 1 && 10#${value} <= 65535 ))
+}
+
+is_host_name_or_ipv4() {
+  local value="$1"
+
+  [[ -n "${value}" ]] || return 1
+  [[ ! "${value}" =~ [[:space:]] ]] || return 1
+  [[ "${value}" != *[:/?#@]* ]] || return 1
+  [[ "${#value}" -le 253 ]] || return 1
+  [[ "${value}" == "localhost" ]] && return 0
+  is_ipv4_address "${value}" && return 0
+  [[ "${value}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+
+is_bind_host() {
+  local value="$1"
+
+  is_ipv4_address "${value}"
+}
+
+is_http_origin() {
+  local value="$1"
+  local rest host port
+
+  [[ -n "${value}" ]] || return 1
+  [[ ! "${value}" =~ [[:space:]] ]] || return 1
+  [[ "${value}" != *,* ]] || return 1
+
+  case "${value}" in
+    http://*) rest="${value#http://}" ;;
+    https://*) rest="${value#https://}" ;;
+    *) return 1 ;;
+  esac
+
+  [[ -n "${rest}" ]] || return 1
+  [[ "${rest}" != */* && "${rest}" != *\?* && "${rest}" != *#* ]] || return 1
+
+  host="${rest}"
+  port=""
+  if [[ "${rest}" == *:* ]]; then
+    host="${rest%:*}"
+    port="${rest##*:}"
+    [[ "${host}" != *:* ]] || return 1
+    is_port_number "${port}" || return 1
+  fi
+
+  is_host_name_or_ipv4 "${host}"
+}
+
+validate_origin_list() {
+  local value="$1"
+  local origin
+  local -a origins=()
+
+  IFS=, read -r -a origins <<< "${value}"
+  [[ "${#origins[@]}" -gt 0 ]] || return 1
+
+  for origin in "${origins[@]}"; do
+    origin="$(trim_spaces "${origin}")"
+    is_http_origin "${origin}" || return 1
+  done
+}
+
+is_bool_value() {
+  case "$1" in
+    true|false|TRUE|FALSE|True|False) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_bool_value() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 set_proxy_cidr_default_from_source() {
   local source="$1"
 
@@ -1427,7 +1779,7 @@ select_proxy_cidr_default_or_back() {
   log "  b) Back to reverse proxy choice"
 
   while true; do
-    if ! read -r -p "Proxy location [2]: " choice; then
+    if ! read_prompt choice "Proxy location [2]: "; then
       fail "No input received for reverse proxy location."
     fi
     choice="${choice:-2}"
@@ -1439,7 +1791,7 @@ select_proxy_cidr_default_or_back() {
         ;;
       2|different|remote|other)
         while true; do
-          if ! read -r -p "Proxy source IP as Breeze sees it, or b to go back: " source_host; then
+          if ! read_prompt source_host "Proxy source IP as Breeze sees it, or b to go back: "; then
             fail "No input received for reverse proxy source IP."
           fi
           if is_back_answer "${source_host}"; then
@@ -1470,7 +1822,7 @@ prompt_proxy_cidrs_or_back() {
 
   while true; do
     if [[ -n "${default_value}" ]]; then
-      if ! read -r -p "Exact reverse proxy source CIDR(s) allowed to send real client IP headers (BREEZE_EXTERNAL_PROXY_CIDRS) [${default_value}] or b to go back to reverse proxy choice: " answer; then
+      if ! read_prompt answer "Exact reverse proxy source CIDR(s) allowed to send real client IP headers (BREEZE_EXTERNAL_PROXY_CIDRS) [${default_value}] or b to go back to reverse proxy choice: "; then
         fail "No input received for BREEZE_EXTERNAL_PROXY_CIDRS."
       fi
       if is_back_answer "${answer}"; then
@@ -1478,7 +1830,7 @@ prompt_proxy_cidrs_or_back() {
       fi
       answer="${answer:-${default_value}}"
     else
-      if ! read -r -p "Exact reverse proxy source CIDR(s) allowed to send real client IP headers (BREEZE_EXTERNAL_PROXY_CIDRS) or b to go back to reverse proxy choice: " answer; then
+      if ! read_prompt answer "Exact reverse proxy source CIDR(s) allowed to send real client IP headers (BREEZE_EXTERNAL_PROXY_CIDRS) or b to go back to reverse proxy choice: "; then
         fail "No input received for BREEZE_EXTERNAL_PROXY_CIDRS."
       fi
       if is_back_answer "${answer}"; then
@@ -1508,7 +1860,7 @@ select_reverse_proxy() {
   fi
 
   while true; do
-    local choice status
+    local bind_default choice status
 
     section "Reverse Proxy"
     subsection "Traffic Entry Point"
@@ -1519,7 +1871,7 @@ select_reverse_proxy() {
     log "  b) Back to secret workflow"
 
     while true; do
-      if ! read -r -p "Reverse proxy option [1]: " choice; then
+      if ! read_prompt choice "Reverse proxy option [1]: "; then
         fail "No input received for reverse proxy selection."
       fi
       choice="${choice:-1}"
@@ -1567,8 +1919,16 @@ select_reverse_proxy() {
     section "Breeze Listener"
     subsection "Docker Host Bind"
     log "These settings control where Breeze publishes the API/Web ports for ${REVERSE_PROXY_LABEL}."
-    log "Use ${PROXY_TARGET_HOST} for LAN access, 127.0.0.1 for same-host proxy only, or 0.0.0.0 for all interfaces."
-    if PROXY_BIND_HOST="$(prompt_value_or_back "BREEZE_PROXY_BIND_HOST" "Breeze bind IP for API/Web host ports" "${PROXY_TARGET_HOST}" true "reverse proxy choice")"; then
+    if [[ "${PROXY_TARGET_HOST}" == "127.0.0.1" || "${PROXY_TARGET_HOST}" == "localhost" ]]; then
+      log "Use 127.0.0.1 only when ${REVERSE_PROXY_LABEL} runs on this same machine, or 0.0.0.0 for all interfaces."
+    else
+      log "Use ${PROXY_TARGET_HOST} for LAN access from your proxy host, or 0.0.0.0 for all interfaces."
+    fi
+    bind_default="${PROXY_TARGET_HOST}"
+    if ! is_bind_host "${bind_default}"; then
+      bind_default="0.0.0.0"
+    fi
+    if PROXY_BIND_HOST="$(prompt_bind_host_or_back "BREEZE_PROXY_BIND_HOST" "Breeze bind IP for API/Web host ports" "${bind_default}" true "reverse proxy choice")"; then
       :
     else
       status=$?
@@ -1577,7 +1937,7 @@ select_reverse_proxy() {
       fi
       return "${status}"
     fi
-    if API_HOST_PORT="$(prompt_value_or_back "BREEZE_API_HOST_PORT" "Breeze API host port" "${API_HOST_PORT}" true "reverse proxy choice")"; then
+    if API_HOST_PORT="$(prompt_port_or_back "BREEZE_API_HOST_PORT" "Breeze API host port" "${API_HOST_PORT}" true "reverse proxy choice")"; then
       :
     else
       status=$?
@@ -1586,7 +1946,7 @@ select_reverse_proxy() {
       fi
       return "${status}"
     fi
-    if WEB_HOST_PORT="$(prompt_value_or_back "BREEZE_WEB_HOST_PORT" "Breeze Web dashboard host port" "${WEB_HOST_PORT}" true "reverse proxy choice")"; then
+    if WEB_HOST_PORT="$(prompt_port_or_back "BREEZE_WEB_HOST_PORT" "Breeze Web dashboard host port" "${WEB_HOST_PORT}" true "reverse proxy choice")"; then
       :
     else
       status=$?
@@ -1661,7 +2021,7 @@ select_storage_mode() {
     log "  b) Back to reverse proxy choice"
 
     while true; do
-      if ! read -r -p "Storage option [1]: " choice; then
+      if ! read_prompt choice "Storage option [1]: "; then
         fail "No input received for storage selection."
       fi
       choice="${choice:-1}"
@@ -1916,7 +2276,7 @@ check_existing_installation_conflicts() {
   log "  2) Delete existing Postgres storage and continue with a fresh empty database"
 
   while true; do
-    if ! read -r -p "Existing Postgres data action [1]: " action; then
+    if ! read_prompt action "Existing Postgres data action [1]: "; then
       fail "No input received for existing Postgres data action."
     fi
     action="${action:-1}"
@@ -1942,7 +2302,7 @@ materialize_env_from_example() {
   local tmp
   tmp="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
 
-  awk '
+  if ! awk '
     function parse_active_key(line, normalized, parts) {
       normalized = line
       sub(/^[[:space:]]+/, "", normalized)
@@ -2038,10 +2398,23 @@ materialize_env_from_example() {
         }
       }
     }
-  ' "${ENV_FILE}" "${ENV_EXAMPLE_FILE}" "${ENV_EXAMPLE_FILE}" > "${tmp}"
+  ' "${ENV_FILE}" "${ENV_EXAMPLE_FILE}" "${ENV_EXAMPLE_FILE}" > "${tmp}"; then
+    rm -f "${tmp}"
+    fail "Failed to generate updated ${ENV_FILE} from ${ENV_EXAMPLE_FILE}."
+  fi
 
-  mv "${tmp}" "${ENV_FILE}"
-  chmod 600 "${ENV_FILE}"
+  if ! validate_env_rewrite_candidate "${tmp}" "${ENV_FILE}" "preserve"; then
+    rm -f "${tmp}"
+    fail "Generated .env candidate failed integrity checks; existing ${ENV_FILE} was left unchanged."
+  fi
+
+  if ! mv "${tmp}" "${ENV_FILE}"; then
+    rm -f "${tmp}"
+    fail "Failed to replace ${ENV_FILE} with verified .env candidate."
+  fi
+  if ! chmod 600 "${ENV_FILE}"; then
+    fail "Failed to set secure permissions on ${ENV_FILE}."
+  fi
 }
 
 strip_wrapping_quotes() {
@@ -2059,7 +2432,14 @@ strip_wrapping_quotes() {
 get_env_value() {
   local key="$1"
   local value
-  value="$(
+
+  if [[ -e "${ENV_FILE}" && ! -f "${ENV_FILE}" ]]; then
+    fail "${ENV_FILE} exists but is not a regular file; cannot read ${key}."
+  fi
+  [[ -f "${ENV_FILE}" ]] || fail "Missing ${ENV_FILE}; cannot read ${key}."
+  [[ -r "${ENV_FILE}" ]] || fail "${ENV_FILE} is not readable; fix permissions before continuing."
+
+  if ! value="$(
     awk -v key="${key}" '
       $0 ~ "^[[:space:]]*" key "=" {
         raw = substr($0, index($0, "=") + 1)
@@ -2070,8 +2450,11 @@ get_env_value() {
       END {
         if (found != "") print found
       }
-    ' "${ENV_FILE}" 2>/dev/null || true
-  )"
+    ' "${ENV_FILE}"
+  )"; then
+    fail "Failed to read ${key} from ${ENV_FILE}."
+  fi
+
   strip_wrapping_quotes "${value}"
 }
 
@@ -2098,7 +2481,7 @@ set_env_value() {
   formatted="$(format_env_value "${value}")"
   tmp="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
 
-  awk -v key="${key}" -v value="${formatted}" '
+  if ! awk -v key="${key}" -v value="${formatted}" '
     BEGIN { seen = 0 }
     $0 ~ "^[[:space:]]*" key "=" {
       if (seen == 0) {
@@ -2114,8 +2497,21 @@ set_env_value() {
         print key "=" value
       }
     }
-  ' "${ENV_FILE}" > "${tmp}"
-  mv "${tmp}" "${ENV_FILE}"
+  ' "${ENV_FILE}" > "${tmp}"; then
+    rm -f "${tmp}"
+    fail "Failed to update ${key} in ${ENV_FILE}."
+  fi
+
+  if ! validate_set_env_candidate "${tmp}" "${ENV_FILE}" "${key}" "${value}"; then
+    rm -f "${tmp}"
+    fail "Generated .env candidate failed integrity checks while updating ${key}; existing ${ENV_FILE} was left unchanged."
+  fi
+
+  if ! mv "${tmp}" "${ENV_FILE}"; then
+    rm -f "${tmp}"
+    fail "Failed to replace ${ENV_FILE} after updating ${key}."
+  fi
+  chmod 600 "${ENV_FILE}"
 }
 
 looks_like_placeholder() {
@@ -2135,6 +2531,201 @@ looks_like_placeholder() {
   [[ "${value}" == *secure_password_change_me* ]] && return 0
   [[ "${value}" == "__generate_me__" ]] && return 0
   return 1
+}
+
+is_bootstrap_env_key() {
+  local key="$1"
+  local bootstrap_key
+  for bootstrap_key in "${BOOTSTRAP_ENV_KEYS[@]}"; do
+    [[ "${key}" == "${bootstrap_key}" ]] && return 0
+  done
+  return 1
+}
+
+env_active_keys() {
+  local file="$1"
+  awk '
+    function parse_active_key(line, normalized, parts) {
+      normalized = line
+      sub(/^[[:space:]]+/, "", normalized)
+      if (normalized !~ /^[A-Za-z_][A-Za-z0-9_]*=/) return ""
+      split(normalized, parts, "=")
+      return parts[1]
+    }
+    {
+      key = parse_active_key($0)
+      if (key != "" && !seen[key]++) print key
+    }
+  ' "${file}"
+}
+
+env_file_value() {
+  local file="$1"
+  local key="$2"
+  local value
+
+  if ! value="$(
+    awk -v key="${key}" '
+      $0 ~ "^[[:space:]]*" key "=" {
+        raw = substr($0, index($0, "=") + 1)
+        sub(/[[:space:]]+#.*$/, "", raw)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", raw)
+        found = raw
+      }
+      END {
+        if (found != "") print found
+      }
+    ' "${file}"
+  )"; then
+    return 1
+  fi
+
+  strip_wrapping_quotes "${value}"
+}
+
+validate_env_rewrite_candidate() {
+  local candidate="$1"
+  local source="$2"
+  local mode="${3:-preserve}"
+  local keys key old_value new_value
+
+  if [[ ! -s "${candidate}" ]]; then
+    warn "Generated .env candidate is empty."
+    return 1
+  fi
+
+  if ! keys="$(env_active_keys "${source}")"; then
+    warn "Could not read existing keys from ${source}."
+    return 1
+  fi
+
+  while IFS= read -r key; do
+    [[ -n "${key}" ]] || continue
+
+    if [[ "${mode}" == "bootstrap-scrub" ]] && is_bootstrap_env_key "${key}"; then
+      if ! new_value="$(env_file_value "${candidate}" "${key}")"; then
+        warn "Could not verify ${key} in generated .env candidate."
+        return 1
+      fi
+      if [[ -n "${new_value}" ]]; then
+        warn "Bootstrap cleanup candidate still contains ${key}."
+        return 1
+      fi
+      continue
+    fi
+
+    if ! old_value="$(env_file_value "${source}" "${key}")"; then
+      warn "Could not read existing value for ${key} from ${source}."
+      return 1
+    fi
+    if looks_like_placeholder "${old_value}"; then
+      continue
+    fi
+
+    if ! new_value="$(env_file_value "${candidate}" "${key}")"; then
+      warn "Could not verify ${key} in generated .env candidate."
+      return 1
+    fi
+    if [[ "${new_value}" != "${old_value}" ]]; then
+      warn "Generated .env candidate did not preserve existing value for ${key}."
+      return 1
+    fi
+  done <<< "${keys}"
+
+  if [[ "${mode}" == "bootstrap-scrub" ]]; then
+    for key in "${BOOTSTRAP_ENV_KEYS[@]}"; do
+      if ! new_value="$(env_file_value "${candidate}" "${key}")"; then
+        warn "Could not verify ${key} in generated .env candidate."
+        return 1
+      fi
+      if [[ -n "${new_value}" ]]; then
+        warn "Bootstrap cleanup candidate still contains ${key}."
+        return 1
+      fi
+    done
+  fi
+
+  return 0
+}
+
+validate_set_env_candidate() {
+  local candidate="$1"
+  local source="$2"
+  local updated_key="$3"
+  local expected_value="$4"
+  local keys key old_value new_value
+
+  if [[ ! -s "${candidate}" ]]; then
+    warn "Generated .env candidate is empty."
+    return 1
+  fi
+
+  if ! new_value="$(env_file_value "${candidate}" "${updated_key}")"; then
+    warn "Could not verify ${updated_key} in generated .env candidate."
+    return 1
+  fi
+  if [[ "${new_value}" != "${expected_value}" ]]; then
+    warn "Generated .env candidate did not set ${updated_key} correctly."
+    return 1
+  fi
+
+  if ! keys="$(env_active_keys "${source}")"; then
+    warn "Could not read existing keys from ${source}."
+    return 1
+  fi
+
+  while IFS= read -r key; do
+    [[ -n "${key}" ]] || continue
+    [[ "${key}" == "${updated_key}" ]] && continue
+
+    if ! old_value="$(env_file_value "${source}" "${key}")"; then
+      warn "Could not read existing value for ${key} from ${source}."
+      return 1
+    fi
+    if looks_like_placeholder "${old_value}"; then
+      continue
+    fi
+
+    if ! new_value="$(env_file_value "${candidate}" "${key}")"; then
+      warn "Could not verify ${key} in generated .env candidate."
+      return 1
+    fi
+    if [[ "${new_value}" != "${old_value}" ]]; then
+      warn "Generated .env candidate did not preserve existing value for ${key}."
+      return 1
+    fi
+  done <<< "${keys}"
+
+  return 0
+}
+
+write_bootstrap_scrubbed_env_file() {
+  local source="$1"
+  local target="$2"
+  local keys_csv
+
+  keys_csv="$(IFS=,; printf '%s' "${BOOTSTRAP_ENV_KEYS[*]}")"
+  awk -v keys="${keys_csv}" '
+    BEGIN {
+      split(keys, parts, ",")
+      for (i in parts) redact[parts[i]] = 1
+    }
+    function parse_active_key(line, normalized, parts) {
+      normalized = line
+      sub(/^[[:space:]]+/, "", normalized)
+      if (normalized !~ /^[A-Za-z_][A-Za-z0-9_]*=/) return ""
+      split(normalized, parts, "=")
+      return parts[1]
+    }
+    {
+      key = parse_active_key($0)
+      if (key in redact) {
+        print key "="
+        next
+      }
+      print
+    }
+  ' "${source}" > "${target}"
 }
 
 prompt_value() {
@@ -2161,12 +2752,12 @@ prompt_value() {
 
   while true; do
     if [[ -n "${default_value}" ]]; then
-      if ! read -r -p "${label} (${key}) [${default_value}]: " answer; then
+      if ! read_prompt answer "${label} (${key}) [${default_value}]: "; then
         fail "No input received for ${key}."
       fi
       answer="${answer:-${default_value}}"
     else
-      if ! read -r -p "${label} (${key}): " answer; then
+      if ! read_prompt answer "${label} (${key}): "; then
         fail "No input received for ${key}."
       fi
     fi
@@ -2205,7 +2796,7 @@ prompt_value_or_back() {
 
   while true; do
     if [[ -n "${default_value}" ]]; then
-      if ! read -r -p "${label} (${key}) [${default_value}] or b to go back to ${back_label}: " answer; then
+      if ! read_prompt answer "${label} (${key}) [${default_value}] or b to go back to ${back_label}: "; then
         fail "No input received for ${key}."
       fi
       if is_back_answer "${answer}"; then
@@ -2213,7 +2804,7 @@ prompt_value_or_back() {
       fi
       answer="${answer:-${default_value}}"
     else
-      if ! read -r -p "${label} (${key}) or b to go back to ${back_label}: " answer; then
+      if ! read_prompt answer "${label} (${key}) or b to go back to ${back_label}: "; then
         fail "No input received for ${key}."
       fi
       if is_back_answer "${answer}"; then
@@ -2228,6 +2819,183 @@ prompt_value_or_back() {
     fi
     warn "${key} is required."
   done
+}
+
+prompt_validated_value() {
+  local key="$1"
+  local label="$2"
+  local default_value="$3"
+  local required="${4:-true}"
+  local validator="$5"
+  local expectation="$6"
+  local normalizer="${7:-}"
+  local current answer
+
+  current="$(get_env_value "${key}")"
+  if looks_like_placeholder "${current}"; then
+    current=""
+  fi
+  default_value="${current:-${default_value}}"
+
+  if [[ "${YES_MODE}" == "true" ]]; then
+    if [[ -z "${default_value}" && "${required}" == "false" ]]; then
+      set_env_value "${key}" ""
+      printf '%s' ""
+      return
+    fi
+    [[ -n "${default_value}" ]] || fail "${key} requires a value; rerun without --yes or prefill it in ${ENV_FILE}."
+    if ! "${validator}" "${default_value}"; then
+      fail "${key} has invalid value '${default_value}'. Expected ${expectation}."
+    fi
+    if [[ -n "${normalizer}" ]]; then
+      default_value="$("${normalizer}" "${default_value}")"
+    fi
+    set_env_value "${key}" "${default_value}"
+    printf '%s' "${default_value}"
+    return
+  fi
+
+  while true; do
+    if [[ -n "${default_value}" ]]; then
+      if ! read_prompt answer "${label} (${key}) [${default_value}]: "; then
+        fail "No input received for ${key}."
+      fi
+      answer="${answer:-${default_value}}"
+    else
+      if ! read_prompt answer "${label} (${key}): "; then
+        fail "No input received for ${key}."
+      fi
+    fi
+
+    answer="$(trim_spaces "${answer}")"
+    if [[ -z "${answer}" && "${required}" == "false" ]]; then
+      set_env_value "${key}" ""
+      printf '%s' ""
+      return
+    fi
+    if [[ -z "${answer}" ]]; then
+      warn "${key} is required."
+      continue
+    fi
+    if ! "${validator}" "${answer}"; then
+      warn "${key} must be ${expectation}."
+      continue
+    fi
+    if [[ -n "${normalizer}" ]]; then
+      answer="$("${normalizer}" "${answer}")"
+    fi
+    set_env_value "${key}" "${answer}"
+    printf '%s' "${answer}"
+    return
+  done
+}
+
+prompt_validated_value_or_back() {
+  local key="$1"
+  local label="$2"
+  local default_value="$3"
+  local required="${4:-true}"
+  local back_label="${5:-previous step}"
+  local validator="$6"
+  local expectation="$7"
+  local normalizer="${8:-}"
+  local current answer
+
+  current="$(get_env_value "${key}")"
+  if looks_like_placeholder "${current}"; then
+    current=""
+  fi
+  default_value="${current:-${default_value}}"
+
+  if [[ "${YES_MODE}" == "true" ]]; then
+    if [[ -z "${default_value}" && "${required}" == "false" ]]; then
+      set_env_value "${key}" ""
+      printf '%s' ""
+      return
+    fi
+    [[ -n "${default_value}" ]] || fail "${key} requires a value; rerun without --yes or prefill it in ${ENV_FILE}."
+    if ! "${validator}" "${default_value}"; then
+      fail "${key} has invalid value '${default_value}'. Expected ${expectation}."
+    fi
+    if [[ -n "${normalizer}" ]]; then
+      default_value="$("${normalizer}" "${default_value}")"
+    fi
+    set_env_value "${key}" "${default_value}"
+    printf '%s' "${default_value}"
+    return
+  fi
+
+  while true; do
+    if [[ -n "${default_value}" ]]; then
+      if ! read_prompt answer "${label} (${key}) [${default_value}] or b to go back to ${back_label}: "; then
+        fail "No input received for ${key}."
+      fi
+      if is_back_answer "${answer}"; then
+        return "${BACK_STATUS}"
+      fi
+      answer="${answer:-${default_value}}"
+    else
+      if ! read_prompt answer "${label} (${key}) or b to go back to ${back_label}: "; then
+        fail "No input received for ${key}."
+      fi
+      if is_back_answer "${answer}"; then
+        return "${BACK_STATUS}"
+      fi
+    fi
+
+    answer="$(trim_spaces "${answer}")"
+    if [[ -z "${answer}" && "${required}" == "false" ]]; then
+      set_env_value "${key}" ""
+      printf '%s' ""
+      return
+    fi
+    if [[ -z "${answer}" ]]; then
+      warn "${key} is required."
+      continue
+    fi
+    if ! "${validator}" "${answer}"; then
+      warn "${key} must be ${expectation}."
+      continue
+    fi
+    if [[ -n "${normalizer}" ]]; then
+      answer="$("${normalizer}" "${answer}")"
+    fi
+    set_env_value "${key}" "${answer}"
+    printf '%s' "${answer}"
+    return
+  done
+}
+
+prompt_port() {
+  prompt_validated_value "$1" "$2" "$3" "${4:-true}" is_port_number "a port number from 1 to 65535"
+}
+
+prompt_port_or_back() {
+  prompt_validated_value_or_back "$1" "$2" "$3" "${4:-true}" "${5:-previous step}" is_port_number "a port number from 1 to 65535"
+}
+
+prompt_host() {
+  prompt_validated_value "$1" "$2" "$3" "${4:-true}" is_host_name_or_ipv4 "a hostname, domain, localhost, or IPv4 address without a scheme, path, or port"
+}
+
+prompt_host_or_back() {
+  prompt_validated_value_or_back "$1" "$2" "$3" "${4:-true}" "${5:-previous step}" is_host_name_or_ipv4 "a hostname, domain, localhost, or IPv4 address without a scheme, path, or port"
+}
+
+prompt_bind_host_or_back() {
+  prompt_validated_value_or_back "$1" "$2" "$3" "${4:-true}" "${5:-previous step}" is_bind_host "an IPv4 bind address such as 127.0.0.1, 0.0.0.0, or the Breeze host IP"
+}
+
+prompt_origin() {
+  prompt_validated_value "$1" "$2" "$3" "${4:-true}" is_http_origin "an http:// or https:// origin without a path, query string, or fragment"
+}
+
+prompt_origin_list() {
+  prompt_validated_value "$1" "$2" "$3" "${4:-true}" validate_origin_list "comma-separated http:// or https:// origins without paths"
+}
+
+prompt_bool() {
+  prompt_validated_value "$1" "$2" "$3" "${4:-true}" is_bool_value "true or false" normalize_bool_value
 }
 
 generate_secret() {
@@ -2280,11 +3048,11 @@ prompt_secret() {
   default_action="g"
   while true; do
     if [[ "${required}" == "false" ]]; then
-      if ! read -r -p "${label} (${key}) action, g=generate/e=enter/blank=empty [g]: " action; then
+      if ! read_prompt action "${label} (${key}) action, g=generate/e=enter/blank=empty [g]: "; then
         fail "No input received for ${key}."
       fi
     else
-      if ! read -r -p "${label} (${key}) action, g=generate/e=enter [g]: " action; then
+      if ! read_prompt action "${label} (${key}) action, g=generate/e=enter [g]: "; then
         fail "No input received for ${key}."
       fi
     fi
@@ -2297,7 +3065,7 @@ prompt_secret() {
         ;;
       e|E|enter)
         while true; do
-          if ! read -r -s -p "Enter ${key}: " value; then
+          if ! read_secret_prompt value "Enter ${key}: "; then
             fail "No input received for ${key}."
           fi
           printf '\n'
@@ -2308,7 +3076,7 @@ prompt_secret() {
             warn "${key} is required."
             continue
           fi
-          if ! read -r -s -p "Confirm ${key}: " confirm; then
+          if ! read_secret_prompt confirm "Confirm ${key}: "; then
             fail "No confirmation received for ${key}."
           fi
           printf '\n'
@@ -2351,18 +3119,51 @@ urlencode() {
   printf '%s' "${encoded}"
 }
 
+# The Compose and .env.example templates stay pinned to the selected Breeze
+# release tag. This key is the official release-manifest trust anchor, not an
+# app-version setting. Release .env.example files through v0.69.0 can leave it
+# blank, so setup intentionally reads the current official trust root from main
+# instead of failing older installs that still need agent update verification.
+release_manifest_key_main_url() {
+  local repo
+  repo="$(github_repo_for_release_lookup)"
+  printf 'https://raw.githubusercontent.com/%s/main/.env.example' "${repo}"
+}
+
+read_release_manifest_key_from_main() {
+  local body key url
+
+  url="$(release_manifest_key_main_url)"
+  if ! body="$(curl -fsSL --connect-timeout 5 --max-time 15 "${url}")"; then
+    return 1
+  fi
+
+  key="$(
+    awk -F= '
+      $1 == "RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS" {
+        sub(/^[^=]*=/, "")
+        sub(/\r$/, "")
+        print
+        exit
+      }
+    ' <<< "${body}"
+  )"
+  key="$(strip_wrapping_quotes "${key}")"
+  [[ -n "${key}" ]] || return 1
+  [[ ! "${key}" =~ ^(__|example|change-me|changeme) ]] || return 1
+  printf '%s' "${key}"
+}
+
 discover_release_manifest_key() {
-  local candidate
-  for candidate in \
-    "${REPO_ROOT}/.github/workflows/ci-smoke-binary-source-github.yml" \
-    "${WORK_DIR}/.github/workflows/ci-smoke-binary-source-github.yml"
-  do
-    if [[ -f "${candidate}" ]]; then
-      awk -F'"' '/RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS/ { for (i = 2; i <= NF; i += 2) { if ($i != "") { print $i; exit } } }' "${candidate}"
-      return
-    fi
-  done
-  printf '%s' "yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso="
+  local key url
+
+  url="$(release_manifest_key_main_url)"
+  if key="$(read_release_manifest_key_from_main)"; then
+    printf '%s' "${key}"
+    return
+  fi
+
+  fail "Could not fetch RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS from ${url}; check network access and rerun setup."
 }
 
 configure_release_manifest_trust_root() {
@@ -2396,7 +3197,7 @@ github_repo_for_release_lookup() {
     return
   fi
 
-  printf '%s' "LanternOps/breeze"
+  printf '%s' "lanternops/breeze"
 }
 
 strip_release_version_prefix() {
@@ -2404,6 +3205,29 @@ strip_release_version_prefix() {
   version="${version#refs/tags/}"
   version="${version#v}"
   printf '%s' "${version}"
+}
+
+template_ref_for_breeze_version() {
+  local version="$1"
+  version="${version#v}"
+  printf 'v%s' "${version}"
+}
+
+resolve_template_remote_base() {
+  local repo ref
+
+  if [[ -n "${REMOTE_BASE_OVERRIDE}" ]]; then
+    REMOTE_BASE="${REMOTE_BASE_OVERRIDE%/}"
+    warn "Using BREEZE_SETUP_REMOTE_BASE override for templates: ${REMOTE_BASE}"
+    return
+  fi
+
+  [[ -n "${SELECTED_BREEZE_VERSION}" ]] || fail "Select BREEZE_VERSION before downloading templates."
+
+  repo="$(github_repo_for_release_lookup)"
+  ref="$(template_ref_for_breeze_version "${SELECTED_BREEZE_VERSION}")"
+  REMOTE_BASE="https://raw.githubusercontent.com/${repo}/${ref}"
+  log "Template downloads are pinned to Breeze release tag ${ref}."
 }
 
 fetch_latest_github_release_version() {
@@ -2431,14 +3255,21 @@ fetch_latest_github_release_version() {
   return 1
 }
 
-prompt_breeze_version() {
+select_breeze_version() {
   local current latest default_value answer
+
+  if [[ -n "${SELECTED_BREEZE_VERSION}" ]]; then
+    return
+  fi
 
   section "Breeze Version"
 
-  current="$(get_env_value "BREEZE_VERSION")"
-  if looks_like_placeholder "${current}"; then
-    current=""
+  current=""
+  if [[ -f "${ENV_FILE}" ]]; then
+    current="$(get_env_value "BREEZE_VERSION")"
+    if looks_like_placeholder "${current}"; then
+      current=""
+    fi
   fi
 
   if latest="$(fetch_latest_github_release_version)"; then
@@ -2458,7 +3289,7 @@ prompt_breeze_version() {
   if [[ "${YES_MODE}" == "true" ]]; then
     if [[ -n "${default_value}" ]]; then
       answer="${default_value#v}"
-      set_env_value "BREEZE_VERSION" "${answer}"
+      SELECTED_BREEZE_VERSION="${answer}"
       log "Selected Breeze version: ${answer}"
       return
     fi
@@ -2467,24 +3298,30 @@ prompt_breeze_version() {
 
   while true; do
     if [[ -n "${default_value}" ]]; then
-      if ! read -r -p "Breeze version to install [${default_value}]: " answer; then
+      if ! read_prompt answer "Breeze version to install [${default_value}]: "; then
         fail "No input received for BREEZE_VERSION."
       fi
       answer="${answer:-${default_value}}"
     else
-      if ! read -r -p "Breeze version to install: " answer; then
+      if ! read_prompt answer "Breeze version to install: "; then
         fail "No input received for BREEZE_VERSION."
       fi
     fi
 
     if [[ -n "${answer}" ]]; then
       answer="${answer#v}"
-      set_env_value "BREEZE_VERSION" "${answer}"
+      SELECTED_BREEZE_VERSION="${answer}"
       log "Selected Breeze version: ${answer}"
       return
     fi
     warn "BREEZE_VERSION is required."
   done
+}
+
+prompt_breeze_version() {
+  select_breeze_version
+  set_env_value "BREEZE_VERSION" "${SELECTED_BREEZE_VERSION}"
+  log "Using Breeze version: ${SELECTED_BREEZE_VERSION}"
 }
 
 apply_reverse_proxy_env() {
@@ -2524,12 +3361,12 @@ apply_reverse_proxy_env() {
 configure_core_env() {
   section "Required Settings"
 
-  local domain acme_email app_url public_api_url
+  local domain acme_email app_url dashboard_url public_api_url
   local postgres_user postgres_db postgres_port postgres_password postgres_password_url
   local redis_password redis_password_url app_key mfa_key
 
   subsection "Public URLs"
-  domain="$(prompt_value "BREEZE_DOMAIN" "Public domain, or localhost for local testing" "localhost" true)"
+  domain="$(prompt_host "BREEZE_DOMAIN" "Public domain, or localhost for local testing" "localhost" true)"
 
   if [[ "${domain}" == "localhost" ]]; then
     acme_email="admin@example.com"
@@ -2538,11 +3375,12 @@ configure_core_env() {
   fi
   acme_email="$(prompt_value "ACME_EMAIL" "Email for certificate registration notices" "${acme_email}" true)"
 
-  app_url="$(prompt_value "PUBLIC_APP_URL" "Public app URL" "https://${domain}" true)"
-  set_env_value "DASHBOARD_URL" "$(prompt_value "DASHBOARD_URL" "Dashboard URL" "${app_url}" true)"
-  public_api_url="$(prompt_value "PUBLIC_API_URL" "Public API URL used by installers and links" "${app_url}" true)"
+  app_url="$(prompt_origin "PUBLIC_APP_URL" "Public app URL" "https://${domain}" true)"
+  dashboard_url="$(prompt_origin "DASHBOARD_URL" "Dashboard URL" "${app_url}" true)"
+  set_env_value "DASHBOARD_URL" "${dashboard_url}"
+  public_api_url="$(prompt_origin "PUBLIC_API_URL" "Public API URL used by installers and links" "${app_url}" true)"
   set_env_value "API_URL" "${public_api_url}"
-  prompt_value "CORS_ALLOWED_ORIGINS" "Allowed browser origins" "${app_url}" true >/dev/null
+  prompt_origin_list "CORS_ALLOWED_ORIGINS" "Allowed browser origins" "${app_url}" true >/dev/null
 
   set_env_value "NODE_ENV" "production"
   set_env_value "IS_HOSTED" "false"
@@ -2570,7 +3408,7 @@ configure_core_env() {
   subsection "Postgres"
   postgres_user="$(prompt_value "POSTGRES_USER" "Postgres admin user" "breeze" true)"
   postgres_db="$(prompt_value "POSTGRES_DB" "Postgres database name" "breeze" true)"
-  postgres_port="$(prompt_value "POSTGRES_PORT" "Host Postgres port for local tooling" "5432" true)"
+  postgres_port="$(prompt_port "POSTGRES_PORT" "Host Postgres port for local tooling" "5432" true)"
   postgres_password="$(prompt_secret "POSTGRES_PASSWORD" "Postgres password" "hex32" true)"
   postgres_password_url="$(urlencode "${postgres_password}")"
   set_env_value "DATABASE_URL" "postgresql://${postgres_user}:${postgres_password_url}@localhost:${postgres_port}/${postgres_db}"
@@ -2607,13 +3445,8 @@ configure_core_env() {
   BOOTSTRAP_PASSWORD="$(prompt_secret "BREEZE_BOOTSTRAP_ADMIN_PASSWORD" "One-time bootstrap admin password" "base64_32" true)"
 
   log ""
-  log "${C_OK}Bootstrap admin credentials generated and stored temporarily in ${ENV_FILE}.${C_RESET}"
-  log "Email: ${BOOTSTRAP_EMAIL}"
-  log "Password: ${BOOTSTRAP_PASSWORD}"
-  if [[ -n "${BOOTSTRAP_NAME}" ]]; then
-    log "Name: ${BOOTSTRAP_NAME}"
-  fi
-  warn "This password is shown once by the setup script. Store it now, then remove it after first login."
+  log "${C_OK}Bootstrap admin values stored temporarily in ${ENV_FILE}.${C_RESET}"
+  log "Setup will show the one-time password only if Breeze starts successfully and the API is healthy."
 
   set_env_value "EMAIL_FROM" "noreply@${domain}"
   set_env_value "SMTP_FROM" "noreply@${domain}"
@@ -2622,18 +3455,19 @@ configure_core_env() {
 }
 
 configure_optional_env() {
+  local email_from mailgun_from provider s3_endpoint s3_region smtp_from turn_secret
+
   section "Optional Integrations"
 
   subsection "Transactional Email"
   if ask_yes_no "Configure transactional email provider now?" "no"; then
-    local provider
     log "Email provider options:"
     log "  resend"
     log "  smtp"
     log "  mailgun"
     log "  auto"
     while true; do
-      if ! read -r -p "Email provider [auto]: " provider; then
+      if ! read_prompt provider "Email provider [auto]: "; then
         fail "No input received for email provider."
       fi
       provider="${provider:-auto}"
@@ -2646,20 +3480,23 @@ configure_optional_env() {
     case "${provider}" in
       resend)
         prompt_secret "RESEND_API_KEY" "Resend API key" "base64_32" true >/dev/null
-        prompt_value "EMAIL_FROM" "From email address" "$(get_env_value "EMAIL_FROM")" true >/dev/null
+        email_from="$(get_env_value "EMAIL_FROM")"
+        prompt_value "EMAIL_FROM" "From email address" "${email_from}" true >/dev/null
         ;;
       smtp)
         prompt_value "SMTP_HOST" "SMTP host" "" true >/dev/null
-        prompt_value "SMTP_PORT" "SMTP port" "587" true >/dev/null
+        prompt_port "SMTP_PORT" "SMTP port" "587" true >/dev/null
         prompt_value "SMTP_USER" "SMTP username" "" false >/dev/null
         prompt_secret "SMTP_PASS" "SMTP password" "base64_32" false >/dev/null
-        prompt_value "SMTP_FROM" "SMTP from email address" "$(get_env_value "SMTP_FROM")" true >/dev/null
-        prompt_value "SMTP_SECURE" "Use SMTP TLS immediately (true/false)" "false" true >/dev/null
+        smtp_from="$(get_env_value "SMTP_FROM")"
+        prompt_value "SMTP_FROM" "SMTP from email address" "${smtp_from}" true >/dev/null
+        prompt_bool "SMTP_SECURE" "Use SMTP TLS immediately (true/false)" "false" true >/dev/null
         ;;
       mailgun)
         prompt_secret "MAILGUN_API_KEY" "Mailgun API key" "base64_32" true >/dev/null
         prompt_value "MAILGUN_DOMAIN" "Mailgun domain" "" true >/dev/null
-        prompt_value "MAILGUN_FROM" "Mailgun from email address" "$(get_env_value "MAILGUN_FROM")" true >/dev/null
+        mailgun_from="$(get_env_value "MAILGUN_FROM")"
+        prompt_value "MAILGUN_FROM" "Mailgun from email address" "${mailgun_from}" true >/dev/null
         ;;
       auto)
         ;;
@@ -2670,8 +3507,10 @@ configure_optional_env() {
 
   subsection "Object Storage"
   if ask_yes_no "Configure S3-compatible object storage now?" "no"; then
-    prompt_value "S3_ENDPOINT" "S3 endpoint URL" "$(get_env_value "S3_ENDPOINT")" true >/dev/null
-    prompt_value "S3_REGION" "S3 region" "$(get_env_value "S3_REGION")" true >/dev/null
+    s3_endpoint="$(get_env_value "S3_ENDPOINT")"
+    s3_region="$(get_env_value "S3_REGION")"
+    prompt_value "S3_ENDPOINT" "S3 endpoint URL" "${s3_endpoint}" true >/dev/null
+    prompt_value "S3_REGION" "S3 region" "${s3_region}" true >/dev/null
     prompt_value "S3_BUCKET" "S3 bucket" "" true >/dev/null
     prompt_value "S3_ACCESS_KEY" "S3 access key" "" true >/dev/null
     prompt_secret "S3_SECRET_KEY" "S3 secret key" "base64_32" true >/dev/null
@@ -2685,13 +3524,15 @@ configure_optional_env() {
   if ask_yes_no "Enable TURN relay for remote desktop across NAT/firewalls?" "no"; then
     set_env_value "COMPOSE_PROFILES" "turn"
     prompt_value "TURN_HOST" "TURN server public IP address" "" true >/dev/null
-    prompt_value "TURN_PORT" "TURN port" "3478" true >/dev/null
+    prompt_port "TURN_PORT" "TURN port" "3478" true >/dev/null
     prompt_secret "TURN_SECRET" "TURN shared secret" "hex32" true >/dev/null
   else
     set_env_value "COMPOSE_PROFILES" ""
     set_env_value "TURN_HOST" ""
-    if looks_like_placeholder "$(get_env_value "TURN_SECRET")"; then
-      set_env_value "TURN_SECRET" "$(generate_secret hex32)"
+    turn_secret="$(get_env_value "TURN_SECRET")"
+    if looks_like_placeholder "${turn_secret}"; then
+      turn_secret="$(generate_secret hex32)"
+      set_env_value "TURN_SECRET" "${turn_secret}"
     fi
   fi
 }
@@ -2752,7 +3593,10 @@ print_reverse_proxy_console_summary() {
   log ""
   log "Routing reminder:"
   log "  - API paths: /api, /s, /health, /ready, /metrics, /i, /oauth, /.well-known/*, /activate"
-  log "  - Web exceptions: /oauth/consent, /activate/complete, /activate/* with status query"
+  log "  - Web exceptions: /oauth/consent, /activate/complete"
+  if [[ "${REVERSE_PROXY_MODE}" == "custom" ]]; then
+    log "  - Custom proxies can also route /activate/* with a status query to Web."
+  fi
 }
 
 print_generated_config_summary() {
@@ -2784,6 +3628,17 @@ print_bootstrap_cleanup_reminder() {
   warn "Then recreate the API container so the one-time bootstrap values are removed from the running environment."
 }
 
+print_bootstrap_credentials_for_signin() {
+  log "Sign in with the bootstrap admin credentials:"
+  log "  Email: ${BOOTSTRAP_EMAIL}"
+  log "  Password: ${BOOTSTRAP_PASSWORD}"
+  if [[ -n "${BOOTSTRAP_NAME}" ]]; then
+    log "  Name: ${BOOTSTRAP_NAME}"
+  fi
+  warn "This temporary password is visible in terminal scrollback and any captured setup logs until bootstrap cleanup completes."
+  warn "Keep this terminal private, sign in once, then let setup remove BREEZE_BOOTSTRAP_ADMIN_* from ${ENV_FILE}."
+}
+
 confirm_start_after_generation() {
   local choice
 
@@ -2798,7 +3653,7 @@ confirm_start_after_generation() {
     log "Choose the next step:"
     log "  1) Pull images, start Breeze now, and continue guided admin setup"
     log "  2) Quit now with only the generated files"
-    if ! read -r -p "Next step [1]: " choice; then
+    if ! read_prompt choice "Next step [1]: "; then
       fail "No input received for start decision."
     fi
     choice="${choice:-1}"
@@ -2857,12 +3712,19 @@ compose_command_for_display() {
   printf '%s' "${cmd}"
 }
 
+print_api_logs_for_timeout() {
+  log "Recent breeze-api logs:"
+  if ! docker logs --tail 80 breeze-api; then
+    warn "Could not read breeze-api logs. Inspect manually with: docker logs --tail 80 breeze-api"
+  fi
+}
+
 wait_for_api_health() {
   local status
 
   if dry_run_enabled; then
     dry_run_log "Skipping API health wait."
-    return
+    return 0
   fi
 
   log "Waiting for breeze-api container health..."
@@ -2877,21 +3739,65 @@ wait_for_api_health() {
     fi
     sleep 2
   done
-  warn "API did not report healthy within the wait window. Check logs with: docker logs breeze-api"
+  warn "API did not report healthy within the wait window."
+  print_api_logs_for_timeout
+  return 1
+}
+
+handle_bootstrap_cleanup_prewrite_failure() {
+  local backup="$1"
+
+  if rm -f "${backup}"; then
+    log "Removed temporary backup ${backup}; ${ENV_FILE} was left unchanged."
+  else
+    warn "Could not remove temporary backup ${backup}; it may contain bootstrap admin credentials."
+  fi
+  warn "Edit ${ENV_FILE} manually and clear BREEZE_BOOTSTRAP_ADMIN_EMAIL, BREEZE_BOOTSTRAP_ADMIN_PASSWORD, and BREEZE_BOOTSTRAP_ADMIN_NAME after first login."
 }
 
 scrub_bootstrap_env() {
+  local backup tmp
+
   section "Bootstrap Cleanup"
-  set_env_value "BREEZE_BOOTSTRAP_ADMIN_EMAIL" ""
-  set_env_value "BREEZE_BOOTSTRAP_ADMIN_PASSWORD" ""
-  set_env_value "BREEZE_BOOTSTRAP_ADMIN_NAME" ""
-  materialize_env_from_example
+
+  backup="$(backup_path_for "${ENV_FILE}")"
+  if ! cp "${ENV_FILE}" "${backup}"; then
+    fail "Failed to back up ${ENV_FILE} before bootstrap cleanup."
+  fi
+  chmod 600 "${backup}"
+  log "Backed up ${ENV_FILE} to ${backup} before bootstrap cleanup."
+
+  tmp="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+  if ! write_bootstrap_scrubbed_env_file "${ENV_FILE}" "${tmp}"; then
+    rm -f "${tmp}"
+    handle_bootstrap_cleanup_prewrite_failure "${backup}"
+    fail "Failed to create bootstrap cleanup candidate for ${ENV_FILE}."
+  fi
+
+  if ! validate_env_rewrite_candidate "${tmp}" "${ENV_FILE}" "bootstrap-scrub"; then
+    rm -f "${tmp}"
+    handle_bootstrap_cleanup_prewrite_failure "${backup}"
+    fail "Bootstrap cleanup candidate failed integrity checks; existing ${ENV_FILE} was left unchanged."
+  fi
+
+  if ! mv "${tmp}" "${ENV_FILE}"; then
+    rm -f "${tmp}"
+    warn "Leaving backup at ${backup}; it may contain bootstrap admin credentials."
+    fail "Failed to replace ${ENV_FILE} with verified bootstrap cleanup candidate."
+  fi
+  if ! chmod 600 "${ENV_FILE}"; then
+    warn "Leaving backup at ${backup}; it may contain bootstrap admin credentials."
+    fail "Failed to set secure permissions on ${ENV_FILE}."
+  fi
   BOOTSTRAP_SCRUBBED="true"
   log "Removed bootstrap admin values from ${ENV_FILE}."
 
   if [[ "${STACK_STARTED}" == "true" ]]; then
     if ask_yes_no "Recreate the API container now so bootstrap values are removed from its environment?" "yes"; then
-      compose up -d api
+      if ! compose up -d api; then
+        warn "Leaving backup at ${backup}; it may contain bootstrap admin credentials."
+        fail "Failed to recreate the API container after bootstrap cleanup."
+      fi
       if dry_run_enabled; then
         dry_run_log "Would recreate the API container without bootstrap env values."
       else
@@ -2900,6 +3806,12 @@ scrub_bootstrap_env() {
     else
       warn "Bootstrap values are removed from ${ENV_FILE}, but the running API container may still have its old environment until it is recreated."
     fi
+  fi
+
+  if rm -f "${backup}"; then
+    log "Removed temporary backup ${backup}."
+  else
+    warn "Could not remove temporary backup ${backup}; it may contain bootstrap admin credentials."
   fi
 }
 
@@ -2924,16 +3836,19 @@ start_stack() {
   if dry_run_enabled; then
     dry_run_log "Simulating a started stack so the guided admin and boot-start prompts can be reviewed."
   fi
-  wait_for_api_health
+  if ! wait_for_api_health; then
+    warn "Skipping guided admin sign-in and bootstrap cleanup because the API did not become healthy."
+    warn "Keep the bootstrap admin values in ${ENV_FILE} until you can sign in and finish first setup."
+    warn "After fixing startup, rerun setup or manually clear BREEZE_BOOTSTRAP_ADMIN_* after first login."
+    return 1
+  fi
 
   local app_url
   app_url="$(get_env_value "PUBLIC_APP_URL")"
 
   section "Create Admin Account"
   log "Open: ${app_url}"
-  log "Sign in with the bootstrap admin credentials:"
-  log "  Email: ${BOOTSTRAP_EMAIL}"
-  log "  Password: ${BOOTSTRAP_PASSWORD}"
+  print_bootstrap_credentials_for_signin
   log ""
   log "After signing in, finish the initial admin setup in Breeze."
   log "This script will then remove BREEZE_BOOTSTRAP_ADMIN_EMAIL, BREEZE_BOOTSTRAP_ADMIN_PASSWORD, and BREEZE_BOOTSTRAP_ADMIN_NAME from ${ENV_FILE}."
@@ -2966,6 +3881,8 @@ main() {
   fi
 
   check_prerequisites
+  select_breeze_version
+  resolve_template_remote_base
   prepare_templates
   prepare_env_file
   preserve_existing_compose_project_name
