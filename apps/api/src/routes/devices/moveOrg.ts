@@ -19,6 +19,7 @@ import { moveOrgSchema } from './schemas';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { DEVICE_ORG_DENORMALIZED_TABLES, DEVICE_SITE_DENORMALIZED_TABLES } from './core';
 import { disconnectAgent } from '../agentWs';
+import { captureException } from '../../services/sentry';
 
 export const moveOrgRoutes = new Hono();
 
@@ -47,8 +48,8 @@ moveOrgRoutes.use('*', authMiddleware);
  * (see DEVICE_ORG_DENORMALIZED_TABLES). All of them MUST be rewritten in
  * the same transaction or pre-existing rows for this device will be
  * visible only to the OLD org and invisible to the NEW one. Tables that
- * denormalize org_id but have no device_id column (CUSTOM_ORG_REWRITE_TABLES,
- * currently ticket_alert_links) get dedicated rewrites in the same
+ * denormalize org_id but have no device_id column (CUSTOM_ORG_REWRITE_TABLES)
+ * get dedicated rewrites in the same
  * transaction.
  *
  * Audit: writes ONE audit row per org (source + target) so the move shows
@@ -160,6 +161,16 @@ moveOrgRoutes.post(
           sql`UPDATE ${sql.identifier('ticket_alert_links')} SET org_id = ${targetOrgId}::uuid WHERE alert_id IN (SELECT id FROM alerts WHERE device_id = ${deviceId}::uuid)`,
         );
 
+        // Ticket-linked billing rows denormalize org_id from their ticket (Phase 3 spec §2);
+        // tickets bound to this device move org with it, so these must follow —
+        // same stranded-org_id class as ticket_alert_links (#1261).
+        await tx.execute(
+          sql`UPDATE ${sql.identifier('time_entries')} SET org_id = ${targetOrgId}::uuid WHERE ticket_id IN (SELECT id FROM tickets WHERE device_id = ${deviceId}::uuid)`,
+        );
+        await tx.execute(
+          sql`UPDATE ${sql.identifier('ticket_parts')} SET org_id = ${targetOrgId}::uuid WHERE ticket_id IN (SELECT id FROM tickets WHERE device_id = ${deviceId}::uuid)`,
+        );
+
         // Rewrite denormalized site_id on every device-scoped table that has
         // one (currently elevation_requests — see DEVICE_SITE_DENORMALIZED_TABLES
         // in core.ts). Skipping any of these strands rows under the OLD
@@ -173,6 +184,7 @@ moveOrgRoutes.post(
       });
     } catch (err) {
       console.error(`[devices.moveOrg] failed for ${deviceId}:`, err);
+      captureException(err, c);
       // Best-effort audit on the failed cross-tenant move — a rolled-back
       // attempt is security-relevant. Source-org row only since target
       // never committed.

@@ -629,6 +629,7 @@ export * from './ai';
 // ============================================
 
 export * from './tickets';
+export * from './timeEntries';
 export * from './portal';
 
 // ============================================
