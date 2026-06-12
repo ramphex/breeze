@@ -12,6 +12,7 @@ import {
   removeFeatureLink,
   listFeatureLinks,
   validateFeaturePolicyExists,
+  pamInlineSettingsSchema,
 } from '../../services/configurationPolicy';
 import {
   addFeatureLinkSchema,
@@ -96,6 +97,17 @@ featureLinkRoutes.post(
       data.inlineSettings = parsed.data;
     }
 
+    if (data.featureType === 'pam' && data.inlineSettings) {
+      const parsed = pamInlineSettingsSchema.safeParse(data.inlineSettings);
+      if (!parsed.success) {
+        return c.json(
+          { error: 'Invalid pam settings', details: parsed.error.flatten(), issues: parsed.error.issues },
+          400
+        );
+      }
+      data.inlineSettings = parsed.data;
+    }
+
     try {
       const link = await addFeatureLink(
         id,
@@ -174,6 +186,16 @@ featureLinkRoutes.patch(
         if (!parsed.success) {
           return c.json(
             { error: 'Invalid backup settings', details: parsed.error.flatten(), issues: parsed.error.issues },
+            400
+          );
+        }
+        data.inlineSettings = parsed.data;
+      }
+      if (existingLink.featureType === 'pam') {
+        const parsed = pamInlineSettingsSchema.safeParse(data.inlineSettings);
+        if (!parsed.success) {
+          return c.json(
+            { error: 'Invalid pam settings', details: parsed.error.flatten(), issues: parsed.error.issues },
             400
           );
         }

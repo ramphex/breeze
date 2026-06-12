@@ -18,6 +18,11 @@ type fakeHB struct {
 	received []Event
 	failNext atomic.Int32 // number of next posts to fail
 	failErr  error
+	disabled atomic.Bool // simulates uacInterceptionEnabled=false from the server
+}
+
+func (f *fakeHB) IsUACInterceptionEnabled() bool {
+	return !f.disabled.Load()
 }
 
 func (f *fakeHB) SendElevationRequest(req Event) error {
@@ -148,6 +153,81 @@ func TestHandleEventOpportunisticDrainAfterSuccess(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("queue should be empty after opportunistic drain, got %d", n)
+	}
+}
+
+func TestHandleEventDroppedWhenInterceptionDisabled(t *testing.T) {
+	// Reset package-level drop state so this test is independent of run order.
+	dropLogged.Store(false)
+	dropCounter.Store(0)
+
+	hb := &fakeHB{}
+	hb.disabled.Store(true)
+	limiter := ipc.NewRateLimiter(1, dedupeWindow)
+
+	ev := sampleEvent("alice", `C:\Windows\System32\mmc.exe`)
+	handleEvent(ev, limiter, hb, nil)
+	if got := len(hb.Received()); got != 0 {
+		t.Fatalf("expected 0 posts while interception disabled, got %d", got)
+	}
+
+	// Re-enable: dropping before limiter.Allow means the drop did not
+	// consume a dedupe slot, so this first-occurrence event posts
+	// immediately on re-enable. (An event that ALREADY posted within the
+	// dedupe window before a disable would still be deduped — the guard
+	// guarantees drops are free, not that re-enables always post.)
+	hb.disabled.Store(false)
+	handleEvent(ev, limiter, hb, nil)
+	if got := len(hb.Received()); got != 1 {
+		t.Fatalf("expected 1 post after re-enable, got %d", got)
+	}
+}
+
+// TestHandleEventDropCounterAndReenableReset verifies:
+//   - dropCounter increments for every event dropped while disabled
+//   - dropLogged is set to true after the first drop (one-shot)
+//   - on re-enable (first enabled event), the counter resets to 0 and dropLogged resets to false
+func TestHandleEventDropCounterAndReenableReset(t *testing.T) {
+	// Reset package-level drop state so this test is independent of run order.
+	dropLogged.Store(false)
+	dropCounter.Store(0)
+
+	hb := &fakeHB{}
+	hb.disabled.Store(true)
+	// Use a fresh limiter with a short window so re-enable events are not deduped.
+	limiter := ipc.NewRateLimiter(1, dedupeWindow)
+
+	ev1 := sampleEvent("alice", `C:\Windows\System32\mmc.exe`)
+	ev2 := sampleEvent("bob", `C:\Windows\System32\cmd.exe`)
+	ev3 := sampleEvent("carol", `C:\foo.exe`)
+
+	handleEvent(ev1, limiter, hb, nil)
+	handleEvent(ev2, limiter, hb, nil)
+	handleEvent(ev3, limiter, hb, nil)
+
+	if got := dropCounter.Load(); got != 3 {
+		t.Fatalf("expected dropCounter=3 after 3 disabled drops, got %d", got)
+	}
+	if !dropLogged.Load() {
+		t.Fatalf("expected dropLogged=true after first drop")
+	}
+	if got := len(hb.Received()); got != 0 {
+		t.Fatalf("expected 0 posts while disabled, got %d", got)
+	}
+
+	// Re-enable and send a new (unique) event — this should post and reset drop state.
+	hb.disabled.Store(false)
+	evNew := sampleEvent("dave", `C:\unique.exe`)
+	handleEvent(evNew, limiter, hb, nil)
+
+	if got := len(hb.Received()); got != 1 {
+		t.Fatalf("expected 1 post after re-enable, got %d", got)
+	}
+	if got := dropCounter.Load(); got != 0 {
+		t.Fatalf("expected dropCounter reset to 0 after re-enable, got %d", got)
+	}
+	if dropLogged.Load() {
+		t.Fatalf("expected dropLogged reset to false after re-enable")
 	}
 }
 
