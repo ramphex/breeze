@@ -12,7 +12,7 @@ import {
   getDeviceRoleSourceLabel,
   getDeviceRoleSourceColor,
 } from '@/lib/deviceRoles';
-import { formatDeviceOsVersion } from './osDisplay';
+import { formatDeviceDetailOsVersion } from './osDisplay';
 
 type DeviceInfoTabProps = {
   deviceId: string;
@@ -585,7 +585,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
 
       <Section title="Operating System" icon={<Info className="h-4 w-4 text-muted-foreground" />}>
         <InfoRow label="OS Type" value={formatOsType(info?.osType)} />
-        <InfoRow label="OS Version" value={formatDeviceOsVersion(info?.osType, info?.osVersion) || '—'} />
+        <InfoRow label="OS Version" value={formatDeviceDetailOsVersion(info?.osType, info?.osVersion) || '—'} />
         <InfoRow label="OS Build" value={info?.osBuild ?? '—'} />
         <InfoRow label="Architecture" value={info?.architecture ?? '—'} />
       </Section>
