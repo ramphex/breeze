@@ -886,33 +886,20 @@ export default function AddDeviceModal({ isOpen, onClose }: AddDeviceModalProps)
             <p>
               Need to uninstall?{' '}
               <a
-                href="/scripts/uninstall-darwin.sh"
-                download
+                href="/api/v1/agents/uninstall.sh"
+                download="uninstall.sh"
                 className="underline hover:text-foreground"
               >
-                macOS
-              </a>
-              {' · '}
-              <a
-                href="/scripts/uninstall-linux.sh"
-                download
-                className="underline hover:text-foreground"
-              >
-                Linux
+                uninstall.sh
               </a>
             </p>
-            {sha256s['uninstall-darwin.sh'] && (
+            {sha256s['uninstall.sh'] && (
               <p className="mt-1 font-mono text-[10px] leading-tight">
-                macOS SHA256: {sha256s['uninstall-darwin.sh']}
+                SHA256: {sha256s['uninstall.sh']}
                 <br />
-                Verify: <code>shasum -a 256 uninstall-darwin.sh</code>
-              </p>
-            )}
-            {sha256s['uninstall-linux.sh'] && (
-              <p className="mt-1 font-mono text-[10px] leading-tight">
-                Linux SHA256: {sha256s['uninstall-linux.sh']}
+                macOS: <code>shasum -a 256 uninstall.sh</code>
                 <br />
-                Verify: <code>sha256sum uninstall-linux.sh</code>
+                Linux: <code>sha256sum uninstall.sh</code>
               </p>
             )}
           </div>

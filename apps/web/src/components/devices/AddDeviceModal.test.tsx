@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Force a deterministic navigator.userAgent BEFORE importing the component,
 // so `detectUserOS()` resolves to 'windows' regardless of host OS. On macOS
@@ -102,6 +102,10 @@ describe('AddDeviceModal', () => {
     setOrgStore();
   });
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('renders site selector with org sites', () => {
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
 
@@ -126,6 +130,28 @@ describe('AddDeviceModal', () => {
     render(<AddDeviceModal isOpen={false} onClose={vi.fn()} />);
 
     expect(screen.queryByText('Add New Device')).toBeNull();
+  });
+
+  it('links to one public uninstall script and shows platform-specific verify commands', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response('abc123  uninstall.sh\n', {
+        headers: { 'content-type': 'text/plain' },
+      }),
+    ));
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+
+    const link = screen.getByText('uninstall.sh').closest('a');
+    expect(link?.getAttribute('href')).toBe('/api/v1/agents/uninstall.sh');
+    expect(link?.getAttribute('download')).toBe('uninstall.sh');
+    expect(screen.queryByText('macOS', { exact: true })).toBeNull();
+    expect(screen.queryByText('Linux', { exact: true })).toBeNull();
+
+    await waitFor(() => {
+      expect(screen.getByText(/SHA256: abc123/)).toBeDefined();
+    });
+    expect(screen.getByText('shasum -a 256 uninstall.sh')).toBeDefined();
+    expect(screen.getByText('sha256sum uninstall.sh')).toBeDefined();
   });
 
   it('switches platform when platform buttons are clicked', () => {
