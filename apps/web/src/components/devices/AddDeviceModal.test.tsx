@@ -385,6 +385,31 @@ describe('AddDeviceModal', () => {
     });
   });
 
+  it('groups the shared install.sh command under one Linux/macOS option', async () => {
+    fetchWithAuthMock.mockResolvedValueOnce(
+      makeJsonResponse({ token: 'test-token-xyz', enrollmentSecret: 'secret-abc' })
+    );
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByText('CLI Commands'));
+
+    await waitFor(() => {
+      expect(screen.getByText('test-token-xyz')).toBeDefined();
+    });
+
+    expect(screen.getByRole('button', { name: 'Windows' })).toBeDefined();
+    const unixButton = screen.getByRole('button', { name: 'Linux/macOS' });
+    expect(unixButton).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'macOS' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Linux' })).toBeNull();
+
+    fireEvent.click(unixButton);
+
+    expect(screen.getByText(/\/api\/v1\/agents\/install\.sh/)).toBeDefined();
+    expect(screen.getByText('Run in Terminal')).toBeDefined();
+  });
+
   it('requests a multi-use token after the operator raises the device count (#1108)', async () => {
     // Initial single-device fetch on tab open.
     fetchWithAuthMock.mockResolvedValueOnce(
