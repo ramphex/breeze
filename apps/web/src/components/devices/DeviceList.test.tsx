@@ -47,6 +47,22 @@ describe('DeviceList — OS version and build columns', () => {
     expect(screen.getByText('10.0.26200.8655 Build 26200.8655')).toBeInTheDocument();
     expect(screen.queryByText('Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655')).toBeNull();
   });
+
+  it('shows macOS instead of the Darwin kernel name in the OS Version column', () => {
+    const device: Device = {
+      ...baseDevice,
+      os: 'macos',
+      osVersion: 'darwin 26.5.1',
+    };
+
+    render(<DeviceList devices={[device]} />);
+    fireEvent.click(screen.getByRole('button', { name: /columns/i }));
+    fireEvent.click(screen.getByLabelText('OS Version'));
+
+    expect(screen.getByText('macOS 26.5.1')).toBeInTheDocument();
+    expect(screen.queryByText('darwin 26.5.1')).toBeNull();
+    expect(screen.queryByText('26.5.1')).toBeNull();
+  });
 });
 
 describe('DeviceList — agent-silent (watchdog OK) badge (#800 web-UI gap)', () => {

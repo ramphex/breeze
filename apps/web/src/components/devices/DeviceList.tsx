@@ -26,6 +26,7 @@ import {
   type Density,
 } from '@/lib/density';
 import { OSIcon } from './osIcons';
+import { formatDeviceOsVersion } from './osDisplay';
 
 export type DeviceStatus = 'online' | 'offline' | 'maintenance' | 'decommissioned' | 'quarantined' | 'updating' | 'pending';
 export type OSType = 'windows' | 'macos' | 'linux';
@@ -165,16 +166,6 @@ function formatSilentDuration(silentSince: string): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h`;
   return `${Math.floor(hours / 24)}d`;
-}
-
-const windowsVersionBuildSuffix = /\s+\d+\.\d+\.\d+(?:\.\d+)?(?:\s+Build\s+\d+(?:\.\d+)*)?\s*$/i;
-
-function formatOsVersionColumn(device: Pick<Device, 'os' | 'osVersion'>): string {
-  const raw = device.osVersion.trim();
-  if (!raw || device.os !== 'windows') return raw;
-
-  const withoutBuild = raw.replace(windowsVersionBuildSuffix, '').trim();
-  return withoutBuild || raw;
 }
 
 type SortField = 'hostname' | 'status' | 'cpuPercent' | 'ramPercent' | 'lastSeen' | null;
@@ -544,7 +535,7 @@ export default function DeviceList({
       header: () => <th key="osVersion" className="px-3 py-3">OS Version</th>,
       cell: (device) => (
         <td key="osVersion" className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap">
-          {formatOsVersionColumn(device) || dash}
+          {formatDeviceOsVersion(device.os, device.osVersion) || dash}
         </td>
       ),
     },

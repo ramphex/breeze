@@ -50,6 +50,95 @@ function mockInitialLoad(displayName: string | null) {
   });
 }
 
+describe('DeviceInfoTab — OS version and build display', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('keeps Windows build details out of the OS Version row when OS Build is shown', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          hostname: 'WIN-11-HOME',
+          displayName: null,
+          osType: 'windows',
+          osVersion: 'Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655',
+          osBuild: '10.0.26200.8655 Build 26200.8655',
+          architecture: 'amd64',
+          tags: [],
+          status: 'online',
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Operating System');
+    expect(screen.getByText('Microsoft Windows 11 Home')).toBeInTheDocument();
+    expect(screen.getByText('10.0.26200.8655 Build 26200.8655')).toBeInTheDocument();
+    expect(screen.queryByText('Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655')).toBeNull();
+  });
+
+  it('capitalizes Linux distro names in the OS Version row', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          hostname: 'RAMPHEX-PI-P52',
+          displayName: null,
+          osType: 'linux',
+          osVersion: 'raspbian 13.5',
+          osBuild: '6.18.33+rpt-rpi-v8',
+          architecture: 'arm64',
+          tags: [],
+          status: 'online',
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Operating System');
+    expect(screen.getByText('Raspbian 13.5')).toBeInTheDocument();
+    expect(screen.queryByText('raspbian 13.5')).toBeNull();
+  });
+
+  it('omits redundant macOS text from the OS Version row', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          hostname: 'MACBOOK-PRO',
+          displayName: null,
+          osType: 'macos',
+          osVersion: 'darwin 26.5.1',
+          osBuild: '25.5.0',
+          architecture: 'amd64',
+          tags: [],
+          status: 'online',
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Operating System');
+    expect(screen.getByText('macOS')).toBeInTheDocument();
+    expect(screen.getByText('26.5.1')).toBeInTheDocument();
+    expect(screen.queryByText('macOS 26.5.1')).toBeNull();
+  });
+});
+
 describe('DeviceInfoTab — display name inline edit', () => {
   beforeEach(() => {
     vi.clearAllMocks();
