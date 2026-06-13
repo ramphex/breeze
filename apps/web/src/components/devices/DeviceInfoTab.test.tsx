@@ -50,6 +50,40 @@ function mockInitialLoad(displayName: string | null) {
   });
 }
 
+describe('DeviceInfoTab — OS version and build display', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('keeps Windows build details out of the OS Version row when OS Build is shown', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          hostname: 'WIN-11-HOME',
+          displayName: null,
+          osType: 'windows',
+          osVersion: 'Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655',
+          osBuild: '10.0.26200.8655 Build 26200.8655',
+          architecture: 'amd64',
+          tags: [],
+          status: 'online',
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Operating System');
+    expect(screen.getByText('Microsoft Windows 11 Home')).toBeInTheDocument();
+    expect(screen.getByText('10.0.26200.8655 Build 26200.8655')).toBeInTheDocument();
+    expect(screen.queryByText('Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655')).toBeNull();
+  });
+});
+
 describe('DeviceInfoTab — display name inline edit', () => {
   beforeEach(() => {
     vi.clearAllMocks();
