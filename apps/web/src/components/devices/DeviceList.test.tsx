@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 
 import DeviceList, { type Device } from './DeviceList';
@@ -29,6 +29,25 @@ const baseDevice: Device = {
   agentVersion: '0.67.0',
   tags: [],
 };
+
+describe('DeviceList — OS version and build columns', () => {
+  it('keeps Windows build details out of the OS Version column when OS Build is shown', () => {
+    const device: Device = {
+      ...baseDevice,
+      osVersion: 'Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655',
+      osBuild: '10.0.26200.8655 Build 26200.8655',
+    };
+
+    render(<DeviceList devices={[device]} />);
+    fireEvent.click(screen.getByRole('button', { name: /columns/i }));
+    fireEvent.click(screen.getByLabelText('OS Version'));
+    fireEvent.click(screen.getByLabelText('OS Build'));
+
+    expect(screen.getByText('Microsoft Windows 11 Home')).toBeInTheDocument();
+    expect(screen.getByText('10.0.26200.8655 Build 26200.8655')).toBeInTheDocument();
+    expect(screen.queryByText('Microsoft Windows 11 Home 10.0.26200.8655 Build 26200.8655')).toBeNull();
+  });
+});
 
 describe('DeviceList — agent-silent (watchdog OK) badge (#800 web-UI gap)', () => {
   it('renders the amber badge when mainAgentSilentSince is set AND watchdog is reporting', () => {
