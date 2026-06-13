@@ -890,7 +890,7 @@ export default function AddDeviceModal({ isOpen, onClose }: AddDeviceModalProps)
                 download="uninstall.sh"
                 className="underline hover:text-foreground"
               >
-                uninstall.sh
+                Linux/macOS
               </a>
             </p>
             {sha256s['uninstall.sh'] && (

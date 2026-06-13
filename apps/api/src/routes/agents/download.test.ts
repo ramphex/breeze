@@ -251,7 +251,7 @@ describe('GET /uninstall.sh — generated uninstaller script', () => {
     const res = await downloadRoutes.request('/uninstall.sh');
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/plain');
-    expect(res.headers.get('content-disposition')).toContain('filename="uninstall.sh"');
+    expect(res.headers.get('content-disposition')).toBeNull();
     return res.text();
   }
 

@@ -141,11 +141,9 @@ describe('AddDeviceModal', () => {
 
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
 
-    const link = screen.getByText('uninstall.sh').closest('a');
+    const link = screen.getByText('Linux/macOS').closest('a');
     expect(link?.getAttribute('href')).toBe('/api/v1/agents/uninstall.sh');
     expect(link?.getAttribute('download')).toBe('uninstall.sh');
-    expect(screen.queryByText('macOS', { exact: true })).toBeNull();
-    expect(screen.queryByText('Linux', { exact: true })).toBeNull();
 
     await waitFor(() => {
       expect(screen.getByText(/SHA256: abc123/)).toBeDefined();

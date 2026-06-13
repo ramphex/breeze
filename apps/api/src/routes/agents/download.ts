@@ -310,7 +310,6 @@ downloadRoutes.get('/uninstall.sh', async () => {
     status: 200,
     headers: {
       'Content-Type': 'text/plain; charset=utf-8',
-      'Content-Disposition': 'attachment; filename="uninstall.sh"',
       'Cache-Control': 'no-cache',
     },
   });
