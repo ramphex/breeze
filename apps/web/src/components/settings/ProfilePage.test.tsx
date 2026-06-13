@@ -31,9 +31,37 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
     json: vi.fn().mockResolvedValue(payload)
   }) as unknown as Response;
 
+function installLocalStorageStub() {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: vi.fn((key: string) => values.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => {
+      values.set(key, value);
+    }),
+    removeItem: vi.fn((key: string) => {
+      values.delete(key);
+    }),
+    clear: vi.fn(() => {
+      values.clear();
+    }),
+  };
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+}
+
 // Stub URL.createObjectURL / revokeObjectURL — jsdom doesn't provide them by
 // default, and the component calls them when a file is selected for preview.
 beforeEach(() => {
+  installLocalStorageStub();
+  document.documentElement.classList.remove('dark');
+  document.documentElement.removeAttribute('data-density');
+  document.documentElement.removeAttribute('data-font');
   globalThis.URL.createObjectURL = vi.fn(() => 'blob:fake');
   globalThis.URL.revokeObjectURL = vi.fn();
 });
@@ -175,6 +203,67 @@ describe('ProfilePage avatar settings', () => {
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: 'Remove' })).toBeNull();
     });
+  });
+});
+
+describe('ProfilePage theming settings', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchWithAuthMock.mockImplementation(async (url) => {
+      if (String(url) === '/auth/passkeys') {
+        return makeJsonResponse({ passkeys: [] });
+      }
+      if (String(url) === '/users/me') {
+        return makeJsonResponse({
+          preferences: {
+            theme: 'dark',
+            density: 'compact',
+            font: 'system'
+          }
+        });
+      }
+      return undefined as unknown as Response;
+    });
+  });
+
+  it('saves font selection with the existing theme and density preferences', async () => {
+    render(
+      <ProfilePage
+        initialUser={{
+          id: 'user-1',
+          name: 'Casey Admin',
+          email: 'casey@example.com',
+          mfaEnabled: false,
+          preferences: {
+            theme: 'dark',
+            density: 'compact',
+            font: 'breeze'
+          }
+        }}
+      />
+    );
+
+    const systemFontButton = screen.getByText('OS interface font').closest('button');
+    expect(systemFontButton).not.toBeNull();
+    fireEvent.click(systemFontButton!);
+
+    await screen.findByText('Theming preferences saved.');
+
+    const preferenceCall = fetchWithAuthMock.mock.calls.find(
+      ([url]) => String(url) === '/users/me'
+    );
+    expect(preferenceCall).toBeDefined();
+    const [, init] = preferenceCall!;
+    expect(init?.method).toBe('PATCH');
+    expect(JSON.parse(String(init?.body))).toEqual({
+      preferences: {
+        theme: 'dark',
+        density: 'compact',
+        font: 'system'
+      }
+    });
+    expect(localStorage.getItem('breeze.font')).toBe('system');
+    expect(document.documentElement).toHaveAttribute('data-font', 'system');
   });
 });
 

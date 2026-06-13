@@ -4,8 +4,9 @@ import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
 import ChangePasswordForm from './ChangePasswordForm';
 import MFASettings from './MFASettings';
+import ThemingSettings from './ThemingSettings';
 import { createPasskeyCredential, fetchWithAuth, useAuthStore } from '../../stores/auth';
-import type { PasskeyRegistrationOptions } from '../../stores/auth';
+import type { PasskeyRegistrationOptions, UserPreferences } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { useAvatarBlobUrl } from '@/lib/avatarBlobCache';
 
@@ -21,6 +22,7 @@ type User = {
   email: string;
   avatarUrl?: string;
   mfaEnabled?: boolean;
+  preferences?: UserPreferences;
 };
 
 type PasskeySummary = {
@@ -739,6 +741,11 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
           {isProfileLoading ? 'Saving...' : 'Save changes'}
         </button>
       </form>
+
+      <ThemingSettings
+        preferences={user?.preferences}
+        onSaved={(preferences) => setUser(prev => (prev ? { ...prev, preferences } : prev))}
+      />
 
       {/* Change Password */}
       <ChangePasswordForm
