@@ -12,7 +12,6 @@ import {
   writePageSizePreference,
 } from './pageSizePreference';
 import {
-  COLUMN_IDS,
   COLUMN_LABELS,
   readColumnOrder,
   readColumnVisibility,
@@ -168,11 +167,15 @@ function formatSilentDuration(silentSince: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-const osLabels: Record<OSType, string> = {
-  windows: 'Windows',
-  macos: 'macOS',
-  linux: 'Linux'
-};
+const windowsVersionBuildSuffix = /\s+\d+\.\d+\.\d+(?:\.\d+)?(?:\s+Build\s+\d+(?:\.\d+)*)?\s*$/i;
+
+function formatOsVersionColumn(device: Pick<Device, 'os' | 'osVersion'>): string {
+  const raw = device.osVersion.trim();
+  if (!raw || device.os !== 'windows') return raw;
+
+  const withoutBuild = raw.replace(windowsVersionBuildSuffix, '').trim();
+  return withoutBuild || raw;
+}
 
 type SortField = 'hostname' | 'status' | 'cpuPercent' | 'ramPercent' | 'lastSeen' | null;
 type SortDirection = 'asc' | 'desc';
@@ -541,7 +544,7 @@ export default function DeviceList({
       header: () => <th key="osVersion" className="px-3 py-3">OS Version</th>,
       cell: (device) => (
         <td key="osVersion" className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap">
-          {device.osVersion || dash}
+          {formatOsVersionColumn(device) || dash}
         </td>
       ),
     },
