@@ -742,11 +742,6 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         </button>
       </form>
 
-      <ThemingSettings
-        preferences={user?.preferences}
-        onSaved={(preferences) => setUser(prev => (prev ? { ...prev, preferences } : prev))}
-      />
-
       {/* Change Password */}
       <ChangePasswordForm
         onSubmit={handlePasswordChange}
@@ -919,6 +914,11 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
           </div>
         )}
       </div>
+
+      <ThemingSettings
+        preferences={user?.preferences}
+        onSaved={(preferences) => setUser(prev => (prev ? { ...prev, preferences } : prev))}
+      />
 
       {/* Onboarding */}
       <div className="rounded-lg border bg-card p-6 shadow-sm">

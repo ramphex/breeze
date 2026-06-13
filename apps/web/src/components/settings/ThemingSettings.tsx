@@ -9,6 +9,9 @@ import {
   readDensity,
   readFontPreference,
   readThemePreference,
+  subscribeDensity,
+  subscribeFont,
+  subscribeTheme,
   type Density,
   type FontPreference,
   type ThemePreference,
@@ -63,6 +66,18 @@ export default function ThemingSettings({ preferences, onSaved }: ThemingSetting
   useEffect(() => {
     syncAppearanceState(preferences);
   }, [preferences, syncAppearanceState]);
+
+  useEffect(() => {
+    const unsubscribeTheme = subscribeTheme(setThemePreference);
+    const unsubscribeDensity = subscribeDensity(setDensityPreference);
+    const unsubscribeFont = subscribeFont(setFontPreference);
+
+    return () => {
+      unsubscribeTheme();
+      unsubscribeDensity();
+      unsubscribeFont();
+    };
+  }, []);
 
   const handleAppearanceChange = async (
     patch: Partial<Pick<Required<UserPreferences>, 'theme' | 'density' | 'font'>>

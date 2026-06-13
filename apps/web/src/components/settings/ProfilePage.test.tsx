@@ -1,8 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import ProfilePage from './ProfilePage';
 import { fetchWithAuth } from '../../stores/auth';
+import { writeDensity, writeFontPreference, writeThemePreference } from '@/lib/appearance';
 
 vi.mock('../../stores/auth', () => ({
   createPasskeyCredential: vi.fn(),
@@ -223,6 +224,59 @@ describe('ProfilePage theming settings', () => {
         });
       }
       return undefined as unknown as Response;
+    });
+  });
+
+  it('renders theming below the passkeys section', async () => {
+    render(
+      <ProfilePage
+        initialUser={{
+          id: 'user-1',
+          name: 'Casey Admin',
+          email: 'casey@example.com',
+          mfaEnabled: false
+        }}
+      />
+    );
+
+    await screen.findByText('No passkeys are registered for this account.');
+    const addPasskeyButton = screen.getByRole('button', { name: 'Add passkey' });
+    const themingHeading = screen.getByRole('heading', { name: 'Theming' });
+
+    expect(
+      addPasskeyButton.compareDocumentPosition(themingHeading) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+  });
+
+  it('reflects appearance changes made outside the profile page', async () => {
+    render(
+      <ProfilePage
+        initialUser={{
+          id: 'user-1',
+          name: 'Casey Admin',
+          email: 'casey@example.com',
+          mfaEnabled: false,
+          preferences: {
+            theme: 'light',
+            density: 'comfortable',
+            font: 'breeze'
+          }
+        }}
+      />
+    );
+
+    await screen.findByText('No passkeys are registered for this account.');
+
+    act(() => {
+      writeThemePreference('dark');
+      writeDensity('dense');
+      writeFontPreference('system');
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Dark/i })).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByRole('button', { name: /Dense/i })).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByText('OS interface font').closest('button')).toHaveAttribute('aria-pressed', 'true');
     });
   });
 
