@@ -1,0 +1,47 @@
+name: Build OS Display Test Web Image
+
+on:
+  push:
+    branches:
+      - test/os-display-labels-image-build
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/web
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-web-image:
+    name: Build & Push Test Web Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Web image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:os-display-labels-test
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-os-display-labels-8e8671af
+          build-args: |
+            PUBLIC_APP_VERSION=os-display-labels-test
+            PUBLIC_ENABLE_REGISTRATION=true
