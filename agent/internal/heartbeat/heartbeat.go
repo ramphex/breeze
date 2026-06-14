@@ -1110,6 +1110,13 @@ func (h *Heartbeat) sendAppleWarrantyInfo() {
 		"coverageType":      info.CoverageType,
 		"deviceName":        info.DeviceName,
 	}
+	// Only include coverageKind when the NDO verb is recognized; omit the key for
+	// timestamp-only/labelless/localized/plist-fallback coverage where it can't be
+	// classified (#1320). The API schema tolerates an empty/absent value and treats
+	// it as fixed for back-compat (#1344), so omitting it here is safe — no 400.
+	if info.CoverageKind != "" {
+		payload["coverageKind"] = info.CoverageKind
+	}
 	h.sendInventoryData("warranty-info", payload, "apple warranty")
 }
 
