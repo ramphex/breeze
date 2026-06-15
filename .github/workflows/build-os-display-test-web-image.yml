@@ -41,7 +41,7 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:os-display-labels-test
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-os-display-labels-8e8671af
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-os-display-labels-${{ github.sha }}
           build-args: |
             PUBLIC_APP_VERSION=os-display-labels-test
             PUBLIC_ENABLE_REGISTRATION=true
