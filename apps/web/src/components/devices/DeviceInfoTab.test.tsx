@@ -116,6 +116,39 @@ describe('DeviceInfoTab — OS version display', () => {
   });
 });
 
+describe('DeviceInfoTab — hardware summary display', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders semicolon-delimited GPU models as a vertical list', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          ...baseDeviceInfoPayload,
+          hardware: {
+            gpuModel: 'SudoMaker Virtual Display Adapter; Intel(R) Graphics; NVIDIA GeForce RTX 5090',
+          },
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Hardware Summary');
+    expect(screen.getByText('SudoMaker Virtual Display Adapter')).toBeInTheDocument();
+    expect(screen.getByText('Intel(R) Graphics')).toBeInTheDocument();
+    expect(screen.getByText('NVIDIA GeForce RTX 5090')).toBeInTheDocument();
+    expect(
+      screen.queryByText('SudoMaker Virtual Display Adapter; Intel(R) Graphics; NVIDIA GeForce RTX 5090'),
+    ).toBeNull();
+  });
+});
+
 describe('DeviceInfoTab — display name inline edit', () => {
   beforeEach(() => {
     vi.clearAllMocks();

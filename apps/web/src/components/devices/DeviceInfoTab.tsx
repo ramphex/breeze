@@ -145,6 +145,28 @@ function InfoRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+function splitGpuModels(value: string | null | undefined): string[] {
+  return (value ?? '')
+    .split(';')
+    .map((model) => model.trim())
+    .filter(Boolean);
+}
+
+function GpuInfoRow({ value }: { value: string | null | undefined }) {
+  const gpuModels = splitGpuModels(value);
+
+  return (
+    <div className="flex justify-between gap-4 py-2">
+      <dt className="text-sm text-muted-foreground">GPU</dt>
+      <dd className="space-y-1 text-sm font-medium text-right">
+        {gpuModels.length > 0
+          ? gpuModels.map((model, index) => <div key={`${model}-${index}`}>{model}</div>)
+          : '—'}
+      </dd>
+    </div>
+  );
+}
+
 function Section({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="rounded-lg border bg-card p-6 shadow-sm">
@@ -605,7 +627,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         } />
         <InfoRow label="RAM Total" value={formatRam(hw?.ramTotalMb)} />
         <InfoRow label="Disk Total" value={formatDisk(hw?.diskTotalGb)} />
-        <InfoRow label="GPU" value={hw?.gpuModel ?? '—'} />
+        <GpuInfoRow value={hw?.gpuModel} />
         <InfoRow label="BIOS Version" value={hw?.biosVersion ?? '—'} />
       </Section>
 
