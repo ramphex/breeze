@@ -140,6 +140,9 @@ func collectPlatformHardware(hw *HardwareInfo) {
 	hw.SerialNumber = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_BIOS", "SerialNumber"))
 	hw.Manufacturer = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_ComputerSystem", "Manufacturer"))
 	hw.Model = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_ComputerSystem", "Model"))
+	hw.MotherboardManufacturer = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_BaseBoard", "Manufacturer"))
+	hw.MotherboardProduct = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_BaseBoard", "Product"))
+	hw.MotherboardVersion = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_BaseBoard", "Version"))
 	hw.BIOSVersion = powershellWmiFirstProperty("Win32_BIOS", "SMBIOSBIOSVersion")
 	hw.GPUModel = powershellWmiJoinedProperties("Win32_VideoController", "Name")
 }

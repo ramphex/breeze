@@ -173,6 +173,31 @@ describe('DeviceInfoTab — hardware summary display', () => {
     expect(screen.queryByText('System Serial Number')).toBeNull();
     expect(screen.queryByText('System Product Name')).toBeNull();
   });
+
+  it('renders motherboard details in the hardware summary', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          ...baseDeviceInfoPayload,
+          hardware: {
+            motherboardManufacturer: 'ASUS',
+            motherboardProduct: 'ASUS ROG STRIX Z790-E GAMING WIFI',
+            motherboardVersion: 'Rev 1.xx',
+          },
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Hardware Summary');
+    expect(screen.getByText('Motherboard')).toBeInTheDocument();
+    expect(screen.getByText('ASUS ROG STRIX Z790-E GAMING WIFI Rev 1.xx')).toBeInTheDocument();
+  });
 });
 
 describe('DeviceInfoTab — display name inline edit', () => {

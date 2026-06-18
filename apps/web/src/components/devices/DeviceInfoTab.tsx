@@ -60,6 +60,9 @@ type DeviceInfo = {
     cpuThreads?: number | null;
     ramTotalMb?: number | null;
     diskTotalGb?: number | null;
+    motherboardManufacturer?: string | null;
+    motherboardProduct?: string | null;
+    motherboardVersion?: string | null;
   } | null;
 };
 
@@ -176,6 +179,34 @@ function formatHardwareIdentityValue(value: string | null | undefined): string {
     return '—';
   }
   return trimmed;
+}
+
+function formatMotherboard(hw: DeviceInfo['hardware']): string {
+  const values = [
+    formatHardwareIdentityValue(hw?.motherboardManufacturer),
+    formatHardwareIdentityValue(hw?.motherboardProduct),
+    formatHardwareIdentityValue(hw?.motherboardVersion),
+  ].filter((part) => part !== '—');
+
+  const parts: string[] = [];
+  for (const value of values) {
+    const valueLower = value.toLowerCase();
+    const containingIndex = parts.findIndex((part) => valueLower.startsWith(`${part.toLowerCase()} `));
+    if (containingIndex >= 0) {
+      parts.splice(containingIndex, 1);
+    }
+    const isDuplicate = parts.some((part) => {
+      const partLower = part.toLowerCase();
+      return partLower === valueLower || partLower.startsWith(`${valueLower} `);
+    });
+    if (!isDuplicate) {
+      parts.push(value);
+    }
+  }
+
+  if (parts.length === 0) return '—';
+
+  return parts.join(' ');
 }
 
 function splitGpuModels(value: string | null | undefined): string[] {
@@ -661,6 +692,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <InfoRow label="RAM Total" value={formatRam(hw?.ramTotalMb)} />
         <InfoRow label="Disk Total" value={formatDisk(hw?.diskTotalGb)} />
         <GpuInfoRow value={hw?.gpuModel} />
+        <InfoRow label="Motherboard" value={formatMotherboard(hw)} />
         <InfoRow label="BIOS Version" value={hw?.biosVersion ?? '—'} />
       </Section>
 

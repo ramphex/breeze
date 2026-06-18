@@ -13,17 +13,20 @@ import (
 )
 
 type HardwareInfo struct {
-	CPUModel     string `json:"cpuModel"`
-	CPUCores     int    `json:"cpuCores"`
-	CPUThreads   int    `json:"cpuThreads"`
-	RAMTotalMB   uint64 `json:"ramTotalMb"`
-	DiskTotalGB  uint64 `json:"diskTotalGb"`
-	GPUModel     string `json:"gpuModel,omitempty"`
-	SerialNumber string `json:"serialNumber,omitempty"`
-	Manufacturer string `json:"manufacturer,omitempty"`
-	Model        string `json:"model,omitempty"`
-	BIOSVersion  string `json:"biosVersion,omitempty"`
-	ChassisType  string `json:"chassisType,omitempty"`
+	CPUModel                string `json:"cpuModel"`
+	CPUCores                int    `json:"cpuCores"`
+	CPUThreads              int    `json:"cpuThreads"`
+	RAMTotalMB              uint64 `json:"ramTotalMb"`
+	DiskTotalGB             uint64 `json:"diskTotalGb"`
+	GPUModel                string `json:"gpuModel,omitempty"`
+	SerialNumber            string `json:"serialNumber,omitempty"`
+	Manufacturer            string `json:"manufacturer,omitempty"`
+	Model                   string `json:"model,omitempty"`
+	MotherboardManufacturer string `json:"motherboardManufacturer,omitempty"`
+	MotherboardProduct      string `json:"motherboardProduct,omitempty"`
+	MotherboardVersion      string `json:"motherboardVersion,omitempty"`
+	BIOSVersion             string `json:"biosVersion,omitempty"`
+	ChassisType             string `json:"chassisType,omitempty"`
 }
 
 type SystemInfo struct {
