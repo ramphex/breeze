@@ -150,6 +150,42 @@ func extractWindowsBuild(v string) string {
 	return v
 }
 
+func cleanHardwareIdentityValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+
+	normalized := strings.ToLower(strings.Join(strings.Fields(value), " "))
+	normalized = strings.Trim(normalized, ".")
+	switch normalized {
+	case "0",
+		"00000000",
+		"000000000000000",
+		"123456789",
+		"default string",
+		"none",
+		"null",
+		"n/a",
+		"na",
+		"not applicable",
+		"not available",
+		"not specified",
+		"o.e.m",
+		"oem",
+		"serial number",
+		"system manufacturer",
+		"system product name",
+		"system serial number",
+		"unknown":
+		return ""
+	}
+	if strings.Contains(normalized, "to be filled by") {
+		return ""
+	}
+	return truncateCollectorString(value)
+}
+
 func (c *HardwareCollector) CollectHardware() (*HardwareInfo, error) {
 	hw := &HardwareInfo{}
 

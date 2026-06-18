@@ -147,6 +147,32 @@ describe('DeviceInfoTab — hardware summary display', () => {
       screen.queryByText('SudoMaker Virtual Display Adapter; Intel(R) Graphics; NVIDIA GeForce RTX 5090'),
     ).toBeNull();
   });
+
+  it('hides placeholder hardware identity values from custom Windows builds', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          ...baseDeviceInfoPayload,
+          hardware: {
+            serialNumber: 'System Serial Number',
+            manufacturer: 'ASUS',
+            model: 'System Product Name',
+          },
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Hardware Summary');
+    expect(screen.getByText('ASUS')).toBeInTheDocument();
+    expect(screen.queryByText('System Serial Number')).toBeNull();
+    expect(screen.queryByText('System Product Name')).toBeNull();
+  });
 });
 
 describe('DeviceInfoTab — display name inline edit', () => {

@@ -129,3 +129,29 @@ func TestExtractWindowsBuild(t *testing.T) {
 		}
 	}
 }
+
+func TestCleanHardwareIdentityValue(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "keeps real manufacturer", in: "ASUS", want: "ASUS"},
+		{name: "keeps real serial", in: "PF4ABC123456", want: "PF4ABC123456"},
+		{name: "trims real value", in: "  ThinkPad X1 Carbon Gen 12  ", want: "ThinkPad X1 Carbon Gen 12"},
+		{name: "drops system serial placeholder", in: "System Serial Number", want: ""},
+		{name: "drops system product placeholder", in: "System Product Name", want: ""},
+		{name: "drops system manufacturer placeholder", in: "System Manufacturer", want: ""},
+		{name: "drops common OEM placeholder", in: "To Be Filled By O.E.M.", want: ""},
+		{name: "drops default string", in: "Default string", want: ""},
+		{name: "drops not specified", in: "Not Specified", want: ""},
+		{name: "drops all-zero placeholder", in: "00000000", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cleanHardwareIdentityValue(tt.in); got != tt.want {
+				t.Errorf("cleanHardwareIdentityValue(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

@@ -145,6 +145,39 @@ function InfoRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+const hardwareIdentityPlaceholderValues = new Set([
+  '0',
+  '00000000',
+  '000000000000000',
+  '123456789',
+  'default string',
+  'none',
+  'null',
+  'n/a',
+  'na',
+  'not applicable',
+  'not available',
+  'not specified',
+  'o.e.m',
+  'oem',
+  'serial number',
+  'system manufacturer',
+  'system product name',
+  'system serial number',
+  'unknown',
+]);
+
+function formatHardwareIdentityValue(value: string | null | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return '—';
+
+  const normalized = trimmed.toLowerCase().replace(/\s+/g, ' ').replace(/\.+$/, '');
+  if (hardwareIdentityPlaceholderValues.has(normalized) || normalized.includes('to be filled by')) {
+    return '—';
+  }
+  return trimmed;
+}
+
 function splitGpuModels(value: string | null | undefined): string[] {
   return (value ?? '')
     .split(';')
@@ -522,9 +555,9 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
             )}
           </dd>
         </div>
-        <InfoRow label="Serial Number" value={hw?.serialNumber ?? '—'} />
-        <InfoRow label="Manufacturer" value={hw?.manufacturer ?? '—'} />
-        <InfoRow label="Model" value={hw?.model ?? '—'} />
+        <InfoRow label="Serial Number" value={formatHardwareIdentityValue(hw?.serialNumber)} />
+        <InfoRow label="Manufacturer" value={formatHardwareIdentityValue(hw?.manufacturer)} />
+        <InfoRow label="Model" value={formatHardwareIdentityValue(hw?.model)} />
       </Section>
 
       <div className="rounded-lg border bg-card p-6 shadow-sm">
