@@ -137,9 +137,9 @@ func enrichOSInfo(info *SystemInfo) {
 }
 
 func collectPlatformHardware(hw *HardwareInfo) {
-	hw.SerialNumber = wmicGet([]string{"bios"}, "SerialNumber")
-	hw.Manufacturer = wmicGet([]string{"computersystem"}, "Manufacturer")
-	hw.Model = wmicGet([]string{"computersystem"}, "Model")
+	hw.SerialNumber = powershellWmiFirstProperty("Win32_BIOS", "SerialNumber")
+	hw.Manufacturer = powershellWmiFirstProperty("Win32_ComputerSystem", "Manufacturer")
+	hw.Model = powershellWmiFirstProperty("Win32_ComputerSystem", "Model")
 	hw.BIOSVersion = powershellWmiFirstProperty("Win32_BIOS", "SMBIOSBIOSVersion")
 	hw.GPUModel = powershellWmiJoinedProperties("Win32_VideoController", "Name")
 }
