@@ -1,0 +1,48 @@
+name: Throwaway Windows Agent Build
+
+on:
+  push:
+    branches:
+      - throwaway/windows-agent-bios-gpu-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-agent:
+    name: Build Windows Agent
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.11'
+          cache-dependency-path: agent/go.sum
+
+      - name: Download Go dependencies
+        working-directory: agent
+        run: go mod download
+
+      - name: Build Windows agent
+        working-directory: agent
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+          BUILD_VERSION: ${{ github.sha }}
+        run: |
+          go build -ldflags="-s -w -X main.version=${BUILD_VERSION}" \
+            -o breeze-agent-windows-amd64.exe \
+            ./cmd/breeze-agent
+
+      - name: Upload Windows agent artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: breeze-agent-windows-amd64
+          path: agent/breeze-agent-windows-amd64.exe
+          retention-days: 3
