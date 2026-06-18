@@ -31,6 +31,41 @@ func wmicGet(args []string, property string) string {
 	return ""
 }
 
+func powershellWmiFirstProperty(className, property string) string {
+	script := fmt.Sprintf(`
+$ErrorActionPreference = 'Stop'
+$items = $null
+if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+  try {
+    $items = Get-CimInstance -ClassName '%s' -ErrorAction Stop
+  } catch {
+    $items = $null
+  }
+}
+if ($null -eq $items -and (Get-Command Get-WmiObject -ErrorAction SilentlyContinue)) {
+  $items = Get-WmiObject -Class '%s' -ErrorAction Stop
+}
+$value = $items |
+  Where-Object { $_.%s } |
+  Select-Object -First 1 -ExpandProperty '%s'
+if ($null -ne $value) {
+  [Console]::WriteLine(([string]$value).Trim())
+}
+`, className, className, property, property)
+
+	out, err := runCollectorOutput(wmicTimeout, "powershell", "-NoProfile", "-NonInteractive", "-Command", utf8PowerShellCommand(script))
+	if err != nil {
+		slog.Debug("powershell WMI query failed", "class", className, "property", property, "error", err.Error())
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if value := strings.TrimSpace(line); value != "" {
+			return truncateCollectorString(value)
+		}
+	}
+	return ""
+}
+
 // enrichOSInfo refines the OS version/build on Windows using the authoritative
 // registry source (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion):
 //
@@ -78,6 +113,6 @@ func collectPlatformHardware(hw *HardwareInfo) {
 	hw.SerialNumber = wmicGet([]string{"bios"}, "SerialNumber")
 	hw.Manufacturer = wmicGet([]string{"computersystem"}, "Manufacturer")
 	hw.Model = wmicGet([]string{"computersystem"}, "Model")
-	hw.BIOSVersion = wmicGet([]string{"bios"}, "SMBIOSBIOSVersion")
-	hw.GPUModel = wmicGet([]string{"path", "win32_videocontroller"}, "Name")
+	hw.BIOSVersion = powershellWmiFirstProperty("Win32_BIOS", "SMBIOSBIOSVersion")
+	hw.GPUModel = powershellWmiFirstProperty("Win32_VideoController", "Name")
 }
