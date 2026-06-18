@@ -155,3 +155,23 @@ func TestCleanHardwareIdentityValue(t *testing.T) {
 		})
 	}
 }
+
+func TestFirstCleanHardwareIdentityValue(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "keeps primary real serial", values: []string{"SERIAL-123", "BOARD-456"}, want: "SERIAL-123"},
+		{name: "falls back when primary is placeholder", values: []string{"System Serial Number", "BOARD-456"}, want: "BOARD-456"},
+		{name: "falls back when primary is empty", values: []string{"", "BOARD-456"}, want: "BOARD-456"},
+		{name: "drops all placeholders", values: []string{"System Serial Number", "To Be Filled By O.E.M."}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstCleanHardwareIdentityValue(tt.values...); got != tt.want {
+				t.Errorf("firstCleanHardwareIdentityValue(%q) = %q, want %q", tt.values, got, tt.want)
+			}
+		})
+	}
+}

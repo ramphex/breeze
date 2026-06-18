@@ -189,6 +189,16 @@ func cleanHardwareIdentityValue(value string) string {
 	return truncateCollectorString(value)
 }
 
+func firstCleanHardwareIdentityValue(values ...string) string {
+	for _, value := range values {
+		cleaned := cleanHardwareIdentityValue(value)
+		if cleaned != "" {
+			return cleaned
+		}
+	}
+	return ""
+}
+
 func (c *HardwareCollector) CollectHardware() (*HardwareInfo, error) {
 	hw := &HardwareInfo{}
 

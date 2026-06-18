@@ -137,7 +137,10 @@ func enrichOSInfo(info *SystemInfo) {
 }
 
 func collectPlatformHardware(hw *HardwareInfo) {
-	hw.SerialNumber = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_BIOS", "SerialNumber"))
+	hw.SerialNumber = firstCleanHardwareIdentityValue(
+		powershellWmiFirstProperty("Win32_BIOS", "SerialNumber"),
+		powershellWmiFirstProperty("Win32_BaseBoard", "SerialNumber"),
+	)
 	hw.Manufacturer = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_ComputerSystem", "Manufacturer"))
 	hw.Model = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_ComputerSystem", "Model"))
 	hw.MotherboardManufacturer = cleanHardwareIdentityValue(powershellWmiFirstProperty("Win32_BaseBoard", "Manufacturer"))
