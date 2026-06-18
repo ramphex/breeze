@@ -31,7 +31,7 @@ func wmicGet(args []string, property string) string {
 	return ""
 }
 
-func powershellWmiFirstProperty(className, property string) string {
+func powershellWmiPropertyValues(className, property string) []string {
 	script := fmt.Sprintf(`
 $ErrorActionPreference = 'Stop'
 $items = $null
@@ -45,25 +45,52 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
 if ($null -eq $items -and (Get-Command Get-WmiObject -ErrorAction SilentlyContinue)) {
   $items = Get-WmiObject -Class '%s' -ErrorAction Stop
 }
-$value = $items |
+$values = $items |
   Where-Object { $_.%s } |
-  Select-Object -First 1 -ExpandProperty '%s'
-if ($null -ne $value) {
-  [Console]::WriteLine(([string]$value).Trim())
+  Select-Object -ExpandProperty '%s'
+foreach ($entry in $values) {
+  if ($null -ne $entry) {
+    [Console]::WriteLine(([string]$entry).Trim())
+  }
 }
 `, className, className, property, property)
 
 	out, err := runCollectorOutput(wmicTimeout, "powershell", "-NoProfile", "-NonInteractive", "-Command", utf8PowerShellCommand(script))
 	if err != nil {
 		slog.Debug("powershell WMI query failed", "class", className, "property", property, "error", err.Error())
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	values := make([]string, 0)
+	for _, line := range strings.Split(string(out), "\n") {
+		value := strings.TrimSpace(line)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values
+}
+
+func powershellWmiFirstProperty(className, property string) string {
+	values := powershellWmiPropertyValues(className, property)
+	if len(values) == 0 {
 		return ""
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if value := strings.TrimSpace(line); value != "" {
-			return truncateCollectorString(value)
-		}
+	return truncateCollectorString(values[0])
+}
+
+func powershellWmiJoinedProperties(className, property string) string {
+	values := powershellWmiPropertyValues(className, property)
+	if len(values) == 0 {
+		return ""
 	}
-	return ""
+	return truncateCollectorString(strings.Join(values, "; "))
 }
 
 // enrichOSInfo refines the OS version/build on Windows using the authoritative
@@ -114,5 +141,5 @@ func collectPlatformHardware(hw *HardwareInfo) {
 	hw.Manufacturer = wmicGet([]string{"computersystem"}, "Manufacturer")
 	hw.Model = wmicGet([]string{"computersystem"}, "Model")
 	hw.BIOSVersion = powershellWmiFirstProperty("Win32_BIOS", "SMBIOSBIOSVersion")
-	hw.GPUModel = powershellWmiFirstProperty("Win32_VideoController", "Name")
+	hw.GPUModel = powershellWmiJoinedProperties("Win32_VideoController", "Name")
 }
