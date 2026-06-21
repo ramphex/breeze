@@ -180,9 +180,9 @@ type Heartbeat struct {
 	// drive SendInput/SetThreadDesktop against the same live consent.exe prompt
 	// concurrently (e.g. an await_remote technician approval firing
 	// actuate_elevation while a re-fired ETW event re-enters RunPamFlow).
-	pamActuateMu sync.Mutex
-	wsDesktopStart   func(sessionID string, displayIndex int, config desktop.StreamConfig, sendFrame desktop.SendFrameFunc) (int, int, error)
-	desktopOwners    sync.Map // desktop session ID -> helper session ID
+	pamActuateMu   sync.Mutex
+	wsDesktopStart func(sessionID string, displayIndex int, config desktop.StreamConfig, sendFrame desktop.SendFrameFunc) (int, int, error)
+	desktopOwners  sync.Map // desktop session ID -> helper session ID
 
 	// Resilience & observability
 	pool        *workerpool.Pool
@@ -1059,11 +1059,11 @@ func (h *Heartbeat) authHeader() string {
 }
 
 // sendInventoryData marshals the payload and sends it to the given endpoint via PUT.
-func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string) {
+func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		log.Error("failed to marshal inventory", "label", label, "error", err.Error())
-		return
+		return err
 	}
 
 	url := fmt.Sprintf("%s/api/v1/agents/%s/%s", h.config.ServerURL, h.config.AgentID, endpoint)
@@ -1078,15 +1078,17 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 	resp, err := httputil.Do(ctx, h.httpClient(), "PUT", url, body, headers, h.retryCfg)
 	if err != nil {
 		log.Error("failed to send inventory", "label", label, "error", err.Error())
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		log.Debug("inventory sent", "label", label)
+		return nil
 	} else {
 		log.Warn("inventory send failed", "label", label, "status", resp.StatusCode)
 	}
+	return fmt.Errorf("inventory send failed for %s: status %d", label, resp.StatusCode)
 }
 
 // processSampleTopN is the per-dimension top-N (CPU and RAM); the union is
@@ -1724,10 +1726,42 @@ func (h *Heartbeat) sendPatchInventory() {
 		return
 	}
 
-	h.sendInventoryData("patches", map[string]any{
-		"patches":   pendingItems,
-		"installed": installedItems,
-	}, fmt.Sprintf("patches (%d pending, %d installed)", len(pendingItems), len(installedItems)))
+	pendingErr, installedErr := h.sendPatchInventoryData(pendingItems, installedItems, "", true)
+	if pendingErr != nil {
+		log.Warn("failed to send pending patch inventory", "error", pendingErr.Error())
+	}
+	if installedErr != nil {
+		log.Warn("failed to send installed patch inventory", "error", installedErr.Error())
+	}
+}
+
+func (h *Heartbeat) sendPatchInventoryData(pendingItems, installedItems []map[string]any, source string, full bool) (error, error) {
+	pendingPayload := map[string]any{
+		"patches": pendingItems,
+	}
+	if source != "" {
+		pendingPayload["source"] = source
+	} else if full {
+		pendingPayload["full"] = true
+	}
+
+	pendingErr := h.sendInventoryData(
+		"patches/pending",
+		pendingPayload,
+		fmt.Sprintf("pending patches (%d)", len(pendingItems)),
+	)
+	if pendingErr != nil {
+		return pendingErr, nil
+	}
+	if len(installedItems) == 0 {
+		return nil, nil
+	}
+	installedErr := h.sendInventoryData(
+		"patches/installed",
+		map[string]any{"installed": installedItems},
+		fmt.Sprintf("installed patches (%d)", len(installedItems)),
+	)
+	return nil, installedErr
 }
 
 func (h *Heartbeat) collectPatchInventory() ([]map[string]any, []map[string]any, error) {

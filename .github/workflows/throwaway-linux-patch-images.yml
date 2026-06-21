@@ -1,0 +1,96 @@
+name: Throwaway Linux Patch Images
+
+on:
+  push:
+    branches:
+      - throwaway/linux-patch-ingest-split-images
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GO_VERSION: '1.25.11'
+  IMAGE_TAG: throwaway-linux-patch-ingest-split
+  REGISTRY: ghcr.io
+
+jobs:
+  api-image:
+    name: Build API Test Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/api:sha-${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ env.IMAGE_TAG }}
+
+  binaries-image:
+    name: Build Linux Agent Binaries Test Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: agent/go.sum
+
+      - name: Build Linux agent binaries
+        working-directory: agent
+        env:
+          BUILD_VERSION: ${{ env.IMAGE_TAG }}
+        run: |
+          mkdir -p ../staging/agent ../staging/viewer ../staging/helper
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-s -w -X main.version=${BUILD_VERSION}" \
+            -o ../staging/agent/breeze-agent-linux-amd64 \
+            ./cmd/breeze-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
+            -ldflags="-s -w -X main.version=${BUILD_VERSION}" \
+            -o ../staging/agent/breeze-agent-linux-arm64 \
+            ./cmd/breeze-agent
+          echo "${BUILD_VERSION}" > ../staging/VERSION
+          find ../staging -type f | sort
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push binaries image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: staging/
+          file: docker/Dockerfile.binaries
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/binaries:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/binaries:sha-${{ github.sha }}
