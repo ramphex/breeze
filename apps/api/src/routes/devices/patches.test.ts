@@ -139,6 +139,18 @@ function selectWhereLimitResult(rows: unknown[]) {
   };
 }
 
+function selectWhereOrderLimitResult(rows: unknown[]) {
+  return {
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        orderBy: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue(rows)
+        })
+      })
+    })
+  };
+}
+
 function selectPatchHistoryRowsResult(rows: unknown[]) {
   return {
     from: vi.fn().mockReturnValue({
@@ -220,6 +232,13 @@ describe('device patch routes', () => {
         requiresReboot: false
       }
       ]) as any)
+      .mockReturnValueOnce(selectWhereOrderLimitResult([
+        {
+          status: 'completed',
+          createdAt: '2026-02-09T09:59:00.000Z',
+          completedAt: '2026-02-09T10:00:00.000Z'
+        }
+      ]) as any)
       .mockReturnValueOnce(selectWhereResult([
         { patchId: '11111111-1111-4111-8111-111111111111' }
       ]) as any);
@@ -245,6 +264,8 @@ describe('device patch routes', () => {
 
     expect(body.data.installed).toHaveLength(1);
     expect(body.data.compliancePercent).toBe(50);
+    expect(body.data.lastPatchScanAt).toBe('2026-02-09T10:00:00.000Z');
+    expect(body.data.lastPatchScanStatus).toBe('completed');
   });
 
   it('excludes Linux installed package inventory from patch compliance', async () => {
@@ -288,6 +309,7 @@ describe('device patch routes', () => {
           requiresReboot: false
         }
       ]) as any)
+      .mockReturnValueOnce(selectWhereOrderLimitResult([]) as any)
       .mockReturnValueOnce(selectWhereResult([]) as any);
 
     const res = await app.request(`/devices/${DEVICE_ID}/patches`, {
@@ -302,6 +324,8 @@ describe('device patch routes', () => {
     expect(body.data.pending[0].externalId).toBe('apt:openssl@3.0.2-0ubuntu1.20');
     expect(body.data.installed).toHaveLength(0);
     expect(body.data.compliancePercent).toBe(0);
+    expect(body.data.lastPatchScanAt).toBeNull();
+    expect(body.data.lastPatchScanStatus).toBeNull();
   });
 
   it('includes successful Linux software updates in install patch history', async () => {
@@ -510,8 +534,10 @@ describe('device patch routes', () => {
   it('does not issue the approvals query when a device has no patches', async () => {
     vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({ id: DEVICE_ID, orgId: '11111111-1111-1111-1111-111111111111' } as any);
     // Device-patch list resolves to an empty array → patchIds is empty →
-    // getApprovedPatchIdsForPartner short-circuits without a second db.select call.
-    vi.mocked(db.select).mockReturnValueOnce(selectPatchStatusResult([]) as any);
+    // getApprovedPatchIdsForPartner short-circuits without an approvals query.
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectPatchStatusResult([]) as any)
+      .mockReturnValueOnce(selectWhereOrderLimitResult([]) as any);
 
     const res = await app.request(`/devices/${DEVICE_ID}/patches`, {
       method: 'GET',
@@ -525,8 +551,9 @@ describe('device patch routes', () => {
     expect(body.data.missing).toEqual([]);
     expect(body.data.installed).toEqual([]);
     expect(body.data.compliancePercent).toBe(100);
-    // Only the device-patch list query ran; the approvals query was skipped.
-    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(body.data.lastPatchScanAt).toBeNull();
+    // Only the device-patch list and last-scan queries ran; the approvals query was skipped.
+    expect(db.select).toHaveBeenCalledTimes(2);
   });
 
   it('queues rollback_patches command for a device patch', async () => {

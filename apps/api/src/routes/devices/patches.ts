@@ -329,6 +329,24 @@ patchesRoutes.get(
       .where(eq(devicePatches.deviceId, deviceId))
       .orderBy(desc(devicePatches.lastCheckedAt));
 
+    const lastPatchScanRows = await db
+      .select({
+        status: deviceCommands.status,
+        createdAt: deviceCommands.createdAt,
+        completedAt: deviceCommands.completedAt,
+      })
+      .from(deviceCommands)
+      .where(
+        and(
+          eq(deviceCommands.deviceId, deviceId),
+          eq(deviceCommands.type, 'patch_scan'),
+          inArray(deviceCommands.status, ['completed', 'failed', 'timeout'])
+        )
+      )
+      .orderBy(desc(sql`coalesce(${deviceCommands.completedAt}, ${deviceCommands.createdAt})`))
+      .limit(1);
+
+    const lastPatchScan = lastPatchScanRows[0] ?? null;
     const patchIds = [...new Set(devicePatchList.map((patch) => patch.patchId))];
     // Derive the partner from the device's org. If the lookup returns null (no partner
     // found), treat the approved set as empty — all patches are unapproved (fail-safe).
@@ -413,6 +431,8 @@ patchesRoutes.get(
     return c.json({
       data: {
         compliancePercent,
+        lastPatchScanAt: lastPatchScan?.completedAt ?? lastPatchScan?.createdAt ?? null,
+        lastPatchScanStatus: lastPatchScan?.status ?? null,
         pending,
         missing,
         installed,

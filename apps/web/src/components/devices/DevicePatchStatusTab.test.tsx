@@ -388,6 +388,8 @@ describe('DevicePatchStatusTab', () => {
       makeJsonResponse({
         data: {
           compliancePercent: 100,
+          lastPatchScanAt: '2026-06-22T06:15:00.000Z',
+          lastPatchScanStatus: 'completed',
           pending: [],
           missing: [
             {
@@ -419,7 +421,11 @@ describe('DevicePatchStatusTab', () => {
 
     expect((installOsButton as HTMLButtonElement).disabled).toBe(true);
     expect((installThirdPartyButton as HTMLButtonElement).disabled).toBe(true);
-    await screen.findByText(/1 stale missing records are excluded from pending install counts\./i);
+    await screen.findByText((_content, node) =>
+      node?.textContent?.startsWith('Last scan:') === true &&
+      node.textContent.includes('Completed')
+    );
+    await screen.findByText(/1 update from earlier scans is no longer reported and is not counted as pending\./i);
   });
 
   it('sends only approved pending OS patch ids to the install endpoint', async () => {

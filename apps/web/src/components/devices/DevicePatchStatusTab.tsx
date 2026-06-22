@@ -45,6 +45,8 @@ type PatchItem = {
 type PatchPayload = {
   compliancePercent?: number;
   compliance?: number;
+  lastPatchScanAt?: string | null;
+  lastPatchScanStatus?: string | null;
   pending?: PatchItem[];
   pendingPatches?: PatchItem[];
   missing?: PatchItem[];
@@ -359,6 +361,17 @@ function formatDate(value?: string, timezone?: string, fallback = 'Not reported'
   if (!value) return fallback;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString([], timezone ? { timeZone: timezone } : undefined);
+}
+
+function formatDateTime(value?: string | null, timezone?: string, fallback = 'Never') {
+  if (!value) return fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], {
+    ...(timezone ? { timeZone: timezone } : {}),
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
 }
 
 function normalizePatchName(patch: PatchItem) {
@@ -780,6 +793,10 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   const nativeAwaitingApproval = useMemo(() => pendingNative.filter(isAwaitingApproval).length, [pendingNative]);
   const thirdPartyAwaitingApproval = useMemo(() => pendingOther.filter(isAwaitingApproval).length, [pendingOther]);
   const displayedInstalledNative = normalizedOsType === 'linux' ? recentLinuxInstalls : installedNative;
+  const lastPatchScanLabel = formatDateTime(payload?.lastPatchScanAt, effectiveTimezone);
+  const lastPatchScanStatus = payload?.lastPatchScanStatus
+    ? payload.lastPatchScanStatus.charAt(0).toUpperCase() + payload.lastPatchScanStatus.slice(1)
+    : null;
 
   // -------------------------------------------------------------------------
   // Post-install polling: poll every 5s for up to 90s watching pending count
@@ -1022,7 +1039,14 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <h3 className="text-lg font-semibold">Patch Controls</h3>
-            <p className="text-sm text-muted-foreground">Queue scans and installs for this device</p>
+            <p className="text-sm text-muted-foreground">
+              Queue scans and installs for this device
+              <span className="mx-2 hidden sm:inline">|</span>
+              <span className="block sm:inline">
+                Last scan: {lastPatchScanLabel}
+                {lastPatchScanStatus && <span> ({lastPatchScanStatus})</span>}
+              </span>
+            </p>
           </div>
           <button
             type="button"
@@ -1104,7 +1128,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
 
         {missingCount > 0 && (
           <p className="mt-3 text-xs text-muted-foreground">
-            {missingCount} stale missing records are excluded from pending install counts.
+            {missingCount} update{missingCount === 1 ? '' : 's'} from earlier scans {missingCount === 1 ? 'is' : 'are'} no longer reported and {missingCount === 1 ? 'is' : 'are'} not counted as pending.
           </p>
         )}
       </div>
