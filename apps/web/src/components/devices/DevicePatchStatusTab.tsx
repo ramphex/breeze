@@ -26,6 +26,7 @@ type PatchItem = {
   title?: string;
   kb?: string;
   kbNumber?: string;
+  version?: string;
   externalId?: string;
   packageId?: string;
   description?: string;
@@ -73,6 +74,7 @@ type PatchHistoryResultItem = {
   installId?: string;
   name?: string;
   title?: string;
+  version?: string;
   source?: string;
   externalId?: string;
   packageId?: string;
@@ -383,18 +385,33 @@ function isLinuxInstallResult(patch: PatchHistoryResultItem) {
     packageId.startsWith('yum:');
 }
 
+function sortPatchItemsByInstalledAtDesc(patches: PatchItem[]): PatchItem[] {
+  return [...patches].sort((a, b) => {
+    const aTime = a.installedAt ? new Date(a.installedAt).getTime() : 0;
+    const bTime = b.installedAt ? new Date(b.installedAt).getTime() : 0;
+    return (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+  });
+}
+
 function recentLinuxInstallsFromHistory(history: PatchHistoryEntry[]): PatchItem[] {
+  const installs: PatchItem[] = [];
+  const seen = new Set<string>();
+
   for (const entry of history) {
     if ((entry.status || '').toLowerCase() !== 'completed') {
       continue;
     }
     const results = entry.result?.results ?? [];
-    const installed = results
-      .filter((patch) => isInstalledResultStatus(patch.status) && isLinuxInstallResult(patch))
-      .map((patch): PatchItem => ({
+    for (const patch of results) {
+      if (!isInstalledResultStatus(patch.status) || !isLinuxInstallResult(patch)) {
+        continue;
+      }
+
+      const installed: PatchItem = {
         id: patch.id ?? patch.installId ?? patch.externalId ?? patch.packageId,
         title: patch.title ?? patch.name ?? patch.packageId ?? patch.installId ?? patch.externalId,
         name: patch.name ?? patch.title ?? patch.packageId ?? patch.installId ?? patch.externalId,
+        version: patch.version,
         source: 'linux',
         status: 'installed',
         externalId: patch.externalId,
@@ -402,13 +419,22 @@ function recentLinuxInstallsFromHistory(history: PatchHistoryEntry[]): PatchItem
         category: 'system',
         installedAt: entry.completedAt,
         requiresReboot: patch.rebootRequired,
-      }));
-    if (installed.length > 0) {
-      return installed;
+      };
+      const key = [
+        installed.id,
+        installed.externalId,
+        installed.packageId,
+        installed.name,
+        installed.installedAt,
+      ].filter(Boolean).join('|');
+      if (!seen.has(key)) {
+        seen.add(key);
+        installs.push(installed);
+      }
     }
   }
 
-  return [];
+  return sortPatchItemsByInstalledAtDesc(installs);
 }
 
 function getSeverityBadge(severity?: string) {
@@ -567,6 +593,9 @@ function getHomebrewUrl(patch: PatchItem, osType: OSType): string | null {
 // ---------------------------------------------------------------------------
 const INSTALL_POLL_INTERVAL_MS = 5_000;
 const INSTALL_POLL_MAX_DURATION_MS = 1_800_000;
+const RECENT_LINUX_INSTALL_DAYS = 7;
+const RECENT_LINUX_INSTALL_HISTORY_LIMIT = 100;
+const RECENT_LINUX_INSTALL_WINDOW_MS = RECENT_LINUX_INSTALL_DAYS * 24 * 60 * 60 * 1000;
 
 export default function DevicePatchStatusTab({ deviceId, timezone, osType }: DevicePatchStatusTabProps) {
   const [payload, setPayload] = useState<PatchPayload | null>(null);
@@ -646,11 +675,13 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     }
 
     try {
+      const completedAfter = new Date(Date.now() - RECENT_LINUX_INSTALL_WINDOW_MS).toISOString();
       const params = new URLSearchParams({
-        limit: '5',
+        limit: String(RECENT_LINUX_INSTALL_HISTORY_LIMIT),
         offset: '0',
         type: 'install',
         status: 'completed',
+        completedAfter,
       });
       const response = await fetchWithAuth(`/devices/${deviceId}/patches/history?${params.toString()}`);
       if (!response.ok) {
@@ -1427,7 +1458,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
             <span className="text-xs text-muted-foreground">({displayedInstalledNative.length})</span>
           </div>
           <div className="mt-4 overflow-hidden rounded-md border">
-            <div className="max-h-64 overflow-y-auto">
+            <div className="max-h-64 overflow-x-auto overflow-y-auto">
               <table className="min-w-full divide-y">
                 <thead className="bg-muted/40 sticky top-0">
                   <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">

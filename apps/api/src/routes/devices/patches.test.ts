@@ -10,6 +10,7 @@ const USER_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 vi.mock('drizzle-orm', () => ({
   and: (...conditions: unknown[]) => ({ op: 'and', conditions }),
   eq: (left: unknown, right: unknown) => ({ op: 'eq', left, right }),
+  gte: (left: unknown, right: unknown) => ({ op: 'gte', left, right }),
   inArray: (left: unknown, right: unknown) => ({ op: 'inArray', left, right }),
   desc: (value: unknown) => ({ op: 'desc', value }),
   sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ op: 'sql', strings, values })
@@ -340,7 +341,13 @@ describe('device patch routes', () => {
         }
       ]) as any);
 
-    const res = await app.request(`/devices/${DEVICE_ID}/patches/history?type=install&status=completed`, {
+    const completedAfter = '2026-06-15T00:00:00.000Z';
+    const params = new URLSearchParams({
+      type: 'install',
+      status: 'completed',
+      completedAfter
+    });
+    const res = await app.request(`/devices/${DEVICE_ID}/patches/history?${params.toString()}`, {
       method: 'GET',
       headers: { Authorization: 'Bearer token' }
     });
@@ -348,7 +355,10 @@ describe('device patch routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
 
-    expect(JSON.stringify(countWhere.mock.calls[0]?.[0])).toContain('software_update');
+    const whereClause = JSON.stringify(countWhere.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('software_update');
+    expect(whereClause).toContain('"op":"gte"');
+    expect(whereClause).toContain(completedAfter);
     expect(body.total).toBe(1);
     expect(body.history).toHaveLength(1);
     expect(body.history[0].type).toBe('software_update');

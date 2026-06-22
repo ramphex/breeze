@@ -261,6 +261,23 @@ describe('DevicePatchStatusTab', () => {
                 ],
               },
             },
+            {
+              type: 'software_update',
+              status: 'completed',
+              completedAt: '2026-06-20T18:30:00.000Z',
+              result: {
+                results: [
+                  {
+                    id: 'installed-2',
+                    title: 'netbird',
+                    source: 'linux',
+                    externalId: 'netbird',
+                    installId: 'netbird',
+                    status: 'installed',
+                  },
+                ],
+              },
+            },
           ],
         });
       }
@@ -302,9 +319,17 @@ describe('DevicePatchStatusTab', () => {
     await screen.findByText('openssl');
     await screen.findByText('Recently Installed Linux Updates');
     await screen.findByText('bash');
+    await screen.findByText('netbird');
     expect(screen.queryByText('Installed Linux Updates')).toBeNull();
     expect(screen.queryByText('zlib1g')).toBeNull();
     expect(screen.queryByText('0% compliant')).not.toBeNull();
+    const historyUrl = fetchWithAuthMock.mock.calls
+      .map(([url]) => String(url))
+      .find((url) => url.includes('/patches/history?') && url.includes('type=install'));
+    expect(historyUrl).toBeTruthy();
+    const historyParams = new URL(`https://test.local${historyUrl}`).searchParams;
+    expect(historyParams.get('limit')).toBe('100');
+    expect(historyParams.get('completedAfter')).toBeTruthy();
   });
 
   it('refreshes recent Linux install history when patch data is refreshed', async () => {

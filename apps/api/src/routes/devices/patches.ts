@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { eq, desc, inArray, and, sql } from 'drizzle-orm';
+import { eq, desc, inArray, and, sql, gte } from 'drizzle-orm';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
@@ -28,7 +28,8 @@ const patchHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(25),
   offset: z.coerce.number().int().min(0).default(0),
   type: z.enum(['install', 'scan', 'rollback', 'all']).default('all'),
-  status: z.enum(['completed', 'failed', 'pending', 'timeout', 'all']).default('all')
+  status: z.enum(['completed', 'failed', 'pending', 'timeout', 'all']).default('all'),
+  completedAfter: z.string().datetime({ offset: true }).optional()
 });
 
 const PATCH_COMMAND_TYPES = ['install_patches', 'patch_scan', 'rollback_patches', 'download_patches'] as const;
@@ -219,7 +220,7 @@ patchesRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const deviceId = c.req.param('id')!;
-    const { limit, offset, type, status } = c.req.valid('query');
+    const { limit, offset, type, status, completedAfter } = c.req.valid('query');
 
     const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
     if (device === SITE_ACCESS_DENIED) {
@@ -237,6 +238,9 @@ patchesRoutes.get(
     ];
     if (status !== 'all') {
       conditions.push(eq(deviceCommands.status, status));
+    }
+    if (completedAfter) {
+      conditions.push(gte(deviceCommands.completedAt, new Date(completedAfter)));
     }
     const whereClause = and(...conditions);
 
