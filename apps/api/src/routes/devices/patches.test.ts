@@ -11,7 +11,8 @@ vi.mock('drizzle-orm', () => ({
   and: (...conditions: unknown[]) => ({ op: 'and', conditions }),
   eq: (left: unknown, right: unknown) => ({ op: 'eq', left, right }),
   inArray: (left: unknown, right: unknown) => ({ op: 'inArray', left, right }),
-  desc: (value: unknown) => ({ op: 'desc', value })
+  desc: (value: unknown) => ({ op: 'desc', value }),
+  sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ op: 'sql', strings, values })
 }));
 
 vi.mock('../../db', () => ({
@@ -52,6 +53,21 @@ vi.mock('../../db/schema', () => ({
     partnerId: 'patchApprovals.partnerId',
     patchId: 'patchApprovals.patchId',
     status: 'patchApprovals.status'
+  },
+  deviceCommands: {
+    id: 'deviceCommands.id',
+    deviceId: 'deviceCommands.deviceId',
+    type: 'deviceCommands.type',
+    payload: 'deviceCommands.payload',
+    status: 'deviceCommands.status',
+    createdAt: 'deviceCommands.createdAt',
+    completedAt: 'deviceCommands.completedAt',
+    result: 'deviceCommands.result',
+    createdBy: 'deviceCommands.createdBy'
+  },
+  users: {
+    id: 'users.id',
+    email: 'users.email'
   }
 }));
 
@@ -117,6 +133,22 @@ function selectWhereLimitResult(rows: unknown[]) {
     from: vi.fn().mockReturnValue({
       where: vi.fn().mockReturnValue({
         limit: vi.fn().mockResolvedValue(rows)
+      })
+    })
+  };
+}
+
+function selectPatchHistoryRowsResult(rows: unknown[]) {
+  return {
+    from: vi.fn().mockReturnValue({
+      leftJoin: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          orderBy: vi.fn().mockReturnValue({
+            limit: vi.fn().mockReturnValue({
+              offset: vi.fn().mockResolvedValue(rows)
+            })
+          })
+        })
       })
     })
   };
@@ -269,6 +301,73 @@ describe('device patch routes', () => {
     expect(body.data.pending[0].externalId).toBe('apt:openssl@3.0.2-0ubuntu1.20');
     expect(body.data.installed).toHaveLength(0);
     expect(body.data.compliancePercent).toBe(0);
+  });
+
+  it('includes successful Linux software updates in install patch history', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({
+      id: DEVICE_ID,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      osType: 'linux'
+    } as any);
+    const countWhere = vi.fn().mockResolvedValue([{ count: 1 }]);
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: countWhere
+        })
+      } as any)
+      .mockReturnValueOnce(selectPatchHistoryRowsResult([
+        {
+          id: 'cmd-software-1',
+          type: 'software_update',
+          payload: { name: 'netbird', source: 'device_software_tab' },
+          status: 'completed',
+          createdAt: '2026-06-22T02:45:00.000Z',
+          completedAt: '2026-06-22T02:46:00.000Z',
+          result: {
+            status: 'completed',
+            exitCode: 0,
+            stdout: JSON.stringify({
+              name: 'netbird',
+              version: '',
+              packageId: '',
+              action: 'update',
+              success: true
+            })
+          },
+          createdBy: USER_ID,
+          createdByEmail: 'test@example.com'
+        }
+      ]) as any);
+
+    const res = await app.request(`/devices/${DEVICE_ID}/patches/history?type=install&status=completed`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(JSON.stringify(countWhere.mock.calls[0]?.[0])).toContain('software_update');
+    expect(body.total).toBe(1);
+    expect(body.history).toHaveLength(1);
+    expect(body.history[0].type).toBe('software_update');
+    expect(body.history[0].result).toMatchObject({
+      installedCount: 1,
+      failedCount: 0,
+      success: true,
+      results: [
+        {
+          id: 'netbird',
+          installId: 'netbird',
+          name: 'netbird',
+          title: 'netbird',
+          source: 'linux',
+          externalId: 'netbird',
+          status: 'installed'
+        }
+      ]
+    });
   });
 
   it('queues install_patches command with patch metadata', async () => {

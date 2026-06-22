@@ -32,6 +32,7 @@ const patchHistoryQuerySchema = z.object({
 });
 
 const PATCH_COMMAND_TYPES = ['install_patches', 'patch_scan', 'rollback_patches', 'download_patches'] as const;
+const LINUX_SOFTWARE_UPDATE_COMMAND_TYPE = 'software_update';
 
 const TYPE_FILTER_MAP: Record<string, string[]> = {
   install: ['install_patches'],
@@ -39,6 +40,15 @@ const TYPE_FILTER_MAP: Record<string, string[]> = {
   rollback: ['rollback_patches'],
   all: [...PATCH_COMMAND_TYPES]
 };
+
+function commandTypesForPatchHistory(type: string, osType?: string | null): string[] {
+  const commandTypes = [...(TYPE_FILTER_MAP[type] ?? PATCH_COMMAND_TYPES)];
+  const normalizedOsType = (osType ?? '').toLowerCase();
+  if ((type === 'install' || type === 'all') && normalizedOsType === 'linux') {
+    commandTypes.push(LINUX_SOFTWARE_UPDATE_COMMAND_TYPE);
+  }
+  return commandTypes;
+}
 
 function safeParsePatchResult(result: unknown): unknown {
   if (!result || typeof result !== 'object') return result;
@@ -101,6 +111,65 @@ function safeParsePatchResult(result: unknown): unknown {
   return raw;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringField(record: Record<string, unknown> | null, key: string): string {
+  const value = record?.[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizePatchHistoryResult(
+  commandType: string,
+  payload: unknown,
+  result: unknown,
+  osType?: string | null
+): unknown {
+  const parsed = safeParsePatchResult(result);
+  if (commandType !== LINUX_SOFTWARE_UPDATE_COMMAND_TYPE || (osType ?? '').toLowerCase() !== 'linux') {
+    return parsed;
+  }
+
+  const raw = asRecord(parsed);
+  if (!raw) return parsed;
+
+  const stdout = asRecord(raw.stdout);
+  if (stdout?.success !== true) {
+    return parsed;
+  }
+
+  const payloadRecord = asRecord(payload);
+  const name = stringField(stdout, 'name') || stringField(payloadRecord, 'name');
+  if (!name) {
+    return parsed;
+  }
+
+  const packageId = stringField(stdout, 'packageId');
+  const version = stringField(stdout, 'version');
+  return {
+    ...raw,
+    installedCount: 1,
+    failedCount: 0,
+    success: true,
+    results: [
+      {
+        id: packageId || name,
+        installId: packageId || name,
+        name,
+        title: name,
+        source: 'linux',
+        externalId: packageId || name,
+        packageId: packageId || undefined,
+        version: version || undefined,
+        status: 'installed',
+      }
+    ]
+  };
+}
+
 /**
  * Resolve which of the given patch IDs carry an explicit partner-wide manual-approval
  * record (`patchApprovals.status = 'approved'`) for the partner.
@@ -160,7 +229,7 @@ patchesRoutes.get(
       return c.json({ error: 'Device not found' }, 404);
     }
 
-    const commandTypes = TYPE_FILTER_MAP[type] ?? PATCH_COMMAND_TYPES;
+    const commandTypes = commandTypesForPatchHistory(type, device.osType);
 
     const conditions = [
       eq(deviceCommands.deviceId, deviceId),
@@ -183,6 +252,7 @@ patchesRoutes.get(
       .select({
         id: deviceCommands.id,
         type: deviceCommands.type,
+        payload: deviceCommands.payload,
         status: deviceCommands.status,
         createdAt: deviceCommands.createdAt,
         completedAt: deviceCommands.completedAt,
@@ -203,7 +273,7 @@ patchesRoutes.get(
       status: row.status,
       createdAt: row.createdAt,
       completedAt: row.completedAt,
-      result: safeParsePatchResult(row.result),
+      result: normalizePatchHistoryResult(row.type, row.payload, row.result, device.osType),
       createdBy: row.createdBy,
       createdByEmail: row.createdByEmail
     }));

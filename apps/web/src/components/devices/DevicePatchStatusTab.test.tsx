@@ -307,6 +307,57 @@ describe('DevicePatchStatusTab', () => {
     expect(screen.queryByText('0% compliant')).not.toBeNull();
   });
 
+  it('refreshes recent Linux install history when patch data is refreshed', async () => {
+    let recentHistoryCalls = 0;
+    fetchWithAuthMock.mockImplementation(async (url: string) => {
+      if (url.includes('/patches/history?') && url.includes('type=install')) {
+        recentHistoryCalls += 1;
+        return makeJsonResponse({
+          history: recentHistoryCalls >= 2
+            ? [
+                {
+                  type: 'software_update',
+                  status: 'completed',
+                  completedAt: '2026-06-22T02:46:00.000Z',
+                  result: {
+                    results: [
+                      {
+                        id: 'netbird',
+                        title: 'netbird',
+                        name: 'netbird',
+                        source: 'linux',
+                        externalId: 'netbird',
+                        installId: 'netbird',
+                        status: 'installed',
+                      },
+                    ],
+                  },
+                },
+              ]
+            : [],
+        });
+      }
+      if (url.includes('/patches/history')) {
+        return makeJsonResponse({ history: [], total: 0 });
+      }
+      return makeJsonResponse({
+        data: {
+          compliancePercent: 100,
+          pending: [],
+          installed: [],
+        },
+      });
+    });
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="linux" />);
+
+    await screen.findByText('No recent Linux update installs.');
+    fireEvent.click(await screen.findByRole('button', { name: /Refresh patch data/i }));
+
+    await screen.findByText('netbird');
+    expect(recentHistoryCalls).toBeGreaterThanOrEqual(2);
+  });
+
   it('excludes missing records from pending install counts', async () => {
     fetchWithAuthMock.mockResolvedValue(
       makeJsonResponse({
@@ -366,6 +417,14 @@ describe('DevicePatchStatusTab', () => {
             category: 'security',
             status: 'pending',
             approvalStatus: 'pending'
+          },
+          {
+            id: 'pending-third-party-1',
+            title: 'Google Chrome',
+            source: 'third_party',
+            category: 'application',
+            status: 'pending',
+            approvalStatus: 'pending'
           }
         ],
         installed: []
@@ -384,6 +443,19 @@ describe('DevicePatchStatusTab', () => {
     // Button count reflects only the approved patch, and surfaces the pending one.
     const installButton = await screen.findByRole('button', { name: /Install pending OS patches \(1\)/i });
     expect(installButton.textContent).toMatch(/1 pending approval/i);
+    expect(screen.getByText('Approved')).toBeTruthy();
+    expect(screen.getAllByText('Pending Approval')).toHaveLength(2);
+
+    const approvedRowInstall = screen.getByLabelText('Install 2026-01 Cumulative Update (KB5050001)');
+    expect((approvedRowInstall as HTMLButtonElement).disabled).toBe(false);
+    const unapprovedOsTitle = 'This org has not approved 2026-01 Feature Update (KB5050099). Approve the patch before installing.';
+    expect(screen.getByTitle(unapprovedOsTitle)).toBeTruthy();
+    const unapprovedOsRowInstall = screen.getByLabelText(unapprovedOsTitle);
+    expect((unapprovedOsRowInstall as HTMLButtonElement).disabled).toBe(true);
+    const unapprovedThirdPartyTitle = 'This org has not approved Google Chrome. Approve the patch before installing.';
+    expect(screen.getByTitle(unapprovedThirdPartyTitle)).toBeTruthy();
+    const unapprovedThirdPartyInstall = screen.getByLabelText(unapprovedThirdPartyTitle);
+    expect((unapprovedThirdPartyInstall as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.click(installButton);
     fireEvent.click(await screen.findByTestId('confirm-install-patches'));

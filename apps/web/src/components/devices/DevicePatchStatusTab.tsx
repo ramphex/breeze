@@ -215,17 +215,38 @@ function readPatchIds(patches: PatchItem[]): string[] {
   return [...unique];
 }
 
-// A patch is awaiting approval only when the API explicitly says so. The
-// device-patches endpoint always sends approvalStatus ('approved' | 'pending'),
-// so an absent value (older payloads / tests) is treated as installable.
+// The device-patches endpoint sends approvalStatus for current payloads. Any
+// explicit non-approved status blocks install controls; an absent value (older
+// payloads / tests) is treated as installable.
 function isAwaitingApproval(patch: PatchItem): boolean {
-  return patch.approvalStatus === 'pending';
+  return !isPatchApprovedForInstall(patch);
 }
 
 // Only approved pending patches may be sent to the install endpoint. Mixing in
 // an unapproved id makes the server reject the whole batch with 409.
 function readApprovedPatchIds(patches: PatchItem[]): string[] {
   return readPatchIds(patches.filter(patch => !isAwaitingApproval(patch)));
+}
+
+function isPatchApprovedForInstall(patch: PatchItem): boolean {
+  // The API sends approvalStatus for current device-patch payloads. Older or
+  // test-only payloads without the field are treated as installable to preserve
+  // existing behavior.
+  return patch.approvalStatus == null || patch.approvalStatus === 'approved';
+}
+
+function getApprovalBadge(patch: PatchItem): { label: string; className: string } {
+  switch ((patch.approvalStatus ?? 'approved').toLowerCase()) {
+    case 'approved':
+      return { label: 'Approved', className: 'bg-success/15 text-success border-success/30' };
+    case 'declined':
+      return { label: 'Declined', className: 'bg-destructive/15 text-destructive border-destructive/30' };
+    case 'deferred':
+      return { label: 'Deferred', className: 'bg-blue-500/20 text-blue-700 border-blue-500/40' };
+    case 'pending':
+    default:
+      return { label: 'Pending Approval', className: 'bg-warning/15 text-warning border-warning/30' };
+  }
 }
 
 function getCategoryBadge(patch: PatchItem, osType: OSType) {
@@ -573,6 +594,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollStartRef = useRef<number>(0);
   const priorPendingCountRef = useRef<number>(-1);
+  const recentLinuxInstallsRequestRef = useRef(0);
 
   // Use provided timezone, fetched siteTimezone, or browser default
   const effectiveTimezone = timezone ?? siteTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -609,45 +631,57 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     fetchPatchStatus();
   }, [fetchPatchStatus]);
 
-  useEffect(() => {
+  const fetchRecentLinuxInstalls = useCallback(async (clear = false) => {
     if (normalizedOsType !== 'linux') {
+      recentLinuxInstallsRequestRef.current += 1;
       setRecentLinuxInstalls([]);
-      return;
+      return [];
     }
 
-    let cancelled = false;
-    const fetchRecentLinuxInstalls = async () => {
+    const requestId = recentLinuxInstallsRequestRef.current + 1;
+    recentLinuxInstallsRequestRef.current = requestId;
+
+    if (clear) {
       setRecentLinuxInstalls([]);
-      try {
-        const params = new URLSearchParams({
-          limit: '5',
-          offset: '0',
-          type: 'install',
-          status: 'completed',
-        });
-        const response = await fetchWithAuth(`/devices/${deviceId}/patches/history?${params.toString()}`);
-        if (!response.ok) {
-          if (!cancelled) {
-            setRecentLinuxInstalls([]);
-          }
-          return;
-        }
-        const json = await response.json() as PatchHistoryResponse;
-        if (!cancelled) {
-          setRecentLinuxInstalls(recentLinuxInstallsFromHistory(json.history ?? []));
-        }
-      } catch {
-        if (!cancelled) {
+    }
+
+    try {
+      const params = new URLSearchParams({
+        limit: '5',
+        offset: '0',
+        type: 'install',
+        status: 'completed',
+      });
+      const response = await fetchWithAuth(`/devices/${deviceId}/patches/history?${params.toString()}`);
+      if (!response.ok) {
+        if (recentLinuxInstallsRequestRef.current === requestId) {
           setRecentLinuxInstalls([]);
         }
+        return [];
       }
-    };
-
-    void fetchRecentLinuxInstalls();
-    return () => {
-      cancelled = true;
-    };
+      const json = await response.json() as PatchHistoryResponse;
+      const installs = recentLinuxInstallsFromHistory(json.history ?? []);
+      if (recentLinuxInstallsRequestRef.current === requestId) {
+        setRecentLinuxInstalls(installs);
+      }
+      return installs;
+    } catch {
+      if (recentLinuxInstallsRequestRef.current === requestId) {
+        setRecentLinuxInstalls([]);
+      }
+      return [];
+    }
   }, [deviceId, normalizedOsType]);
+
+  useEffect(() => {
+    void fetchRecentLinuxInstalls(true);
+  }, [fetchRecentLinuxInstalls]);
+
+  const refreshPatchView = useCallback(async (silent = false) => {
+    const data = await fetchPatchStatus(silent);
+    await fetchRecentLinuxInstalls(false);
+    return data;
+  }, [fetchPatchStatus, fetchRecentLinuxInstalls]);
 
   // Clean up polling on unmount
   useEffect(() => {
@@ -741,7 +775,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
         setIsPolling(false);
         setInstallingPatchIds(new Set());
         setControlNotice({ kind: 'info', message: 'Install is taking longer than expected. macOS updates can take 30+ minutes. Refresh the page later to check status.' });
-        await fetchPatchStatus(true);
+        await refreshPatchView(true);
         return;
       }
 
@@ -760,13 +794,14 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
         setIsPolling(false);
         setInstallingPatchIds(new Set());
         const installed = priorPendingCountRef.current - currentPendingCount;
+        await fetchRecentLinuxInstalls(false);
         setControlNotice({
           kind: 'success',
           message: `${installed} patch${installed !== 1 ? 'es' : ''} installed successfully. ${currentPendingCount} still pending.`
         });
       }
     }, INSTALL_POLL_INTERVAL_MS);
-  }, [fetchPatchStatus]);
+  }, [fetchPatchStatus, fetchRecentLinuxInstalls, refreshPatchView]);
 
   const queuePatchScan = useCallback(async (
     action: 'scan-native' | 'scan-third-party',
@@ -936,7 +971,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
         <p className="text-sm text-destructive">{error}</p>
         <button
           type="button"
-          onClick={() => fetchPatchStatus()}
+          onClick={() => refreshPatchView()}
           className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
         >
           Retry
@@ -960,7 +995,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
           </div>
           <button
             type="button"
-            onClick={() => fetchPatchStatus()}
+            onClick={() => refreshPatchView()}
             disabled={isBusy}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -1083,7 +1118,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
             )}
           </div>
           <div className="mt-4 overflow-hidden rounded-md border">
-            <div className="max-h-64 overflow-y-auto">
+            <div className="max-h-64 overflow-x-auto overflow-y-auto">
               <table className="min-w-full divide-y">
                 <thead className="bg-muted/40 sticky top-0">
                   <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1091,13 +1126,14 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                     {normalizedOsType === 'windows' && <th className="px-4 py-3">KB#</th>}
                     <th className="px-4 py-3">Source</th>
                     <th className="px-4 py-3">Category</th>
+                    <th className="px-4 py-3">Approval</th>
                     <th className="w-16 px-2 py-3" />
                   </tr>
                 </thead>
                 <tbody className="divide-y">
                   {pendingNative.length === 0 ? (
                     <tr>
-                      <td colSpan={normalizedOsType === 'windows' ? 5 : 4} className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      <td colSpan={normalizedOsType === 'windows' ? 6 : 5} className="px-4 py-6 text-center text-sm text-muted-foreground">
                         {displayCopy.pendingNativeEmpty}
                       </td>
                     </tr>
@@ -1111,12 +1147,19 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                       const patchId = patch.id;
                       const isInstalling = patchId ? installingPatchIds.has(patchId) : false;
                       const notDownloaded = patch.isDownloaded === false;
+                      const approvalBadge = getApprovalBadge(patch);
+                      const isApproved = isPatchApprovedForInstall(patch);
+                      const patchName = normalizePatchName(patch);
+                      const installTitle = isApproved
+                        ? `Install ${patchName}`
+                        : `This org has not approved ${patchName}. Approve the patch before installing.`;
+
                       return (
                         <tr key={patch.id ?? `${patch.name ?? patch.title ?? 'pending-native'}-${index}`} className="text-sm">
                           <td className="px-4 py-3">
                             <div className="space-y-1">
                               <div className="flex items-center gap-1.5">
-                                <p className="font-medium">{normalizePatchName(patch)}</p>
+                                <p className="font-medium">{patchName}</p>
                                 {notDownloaded && (
                                   <span title="Not yet downloaded -- install will take longer" className="inline-flex items-center text-muted-foreground">
                                     <CloudDownload className="h-3.5 w-3.5" />
@@ -1177,21 +1220,28 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                               </span>
                             )}
                           </td>
+                          <td className="px-4 py-3">
+                            <span className={`inline-flex items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium ${approvalBadge.className}`}>
+                              {approvalBadge.label}
+                            </span>
+                          </td>
                           <td className="px-2 py-3">
                             {patchId && (
-                              <button
-                                type="button"
-                                title={`Install ${normalizePatchName(patch)}`}
-                                disabled={isBusy || isInstalling}
-                                onClick={() => queueSinglePatchInstall(patchId, normalizePatchName(patch))}
-                                className="inline-flex items-center justify-center rounded-md border p-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                {isInstalling ? (
-                                  <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
-                                ) : (
-                                  <Download className="h-3.5 w-3.5 text-green-600" />
-                                )}
-                              </button>
+                              <span title={installTitle} className="inline-flex">
+                                <button
+                                  type="button"
+                                  aria-label={installTitle}
+                                  disabled={isBusy || isInstalling || !isApproved}
+                                  onClick={() => queueSinglePatchInstall(patchId, patchName)}
+                                  className="inline-flex items-center justify-center rounded-md border p-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {isInstalling ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
+                                  ) : (
+                                    <Download className={`h-3.5 w-3.5 ${isApproved ? 'text-green-600' : 'text-muted-foreground'}`} />
+                                  )}
+                                </button>
+                              </span>
                             )}
                           </td>
                         </tr>
@@ -1218,20 +1268,21 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
             )}
           </div>
           <div className="mt-4 overflow-hidden rounded-md border">
-            <div className="max-h-64 overflow-y-auto">
+            <div className="max-h-64 overflow-x-auto overflow-y-auto">
               <table className="min-w-full divide-y">
                 <thead className="bg-muted/40 sticky top-0">
                   <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                     <th className="px-4 py-3">{displayCopy.pendingThirdPartyPrimaryColumn}</th>
                     <th className="px-4 py-3">Source</th>
                     <th className="px-4 py-3">{displayCopy.pendingThirdPartySecondaryColumn}</th>
+                    <th className="px-4 py-3">Approval</th>
                     <th className="w-16 px-2 py-3" />
                   </tr>
                 </thead>
                 <tbody className="divide-y">
                   {pendingOther.length === 0 ? (
                     <tr>
-                      <td colSpan={4} className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      <td colSpan={5} className="px-4 py-6 text-center text-sm text-muted-foreground">
                         {displayCopy.pendingThirdPartyEmpty}
                       </td>
                     </tr>
@@ -1247,6 +1298,13 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                       const patchId = patch.id;
                       const isInstalling = patchId ? installingPatchIds.has(patchId) : false;
                       const notDownloaded = patch.isDownloaded === false;
+                      const approvalBadge = getApprovalBadge(patch);
+                      const isApproved = isPatchApprovedForInstall(patch);
+                      const patchName = normalizePatchName(patch);
+                      const installTitle = isApproved
+                        ? `Install ${patchName}`
+                        : `This org has not approved ${patchName}. Approve the patch before installing.`;
+
                       return (
                         <tr key={patch.id ?? `${patch.name ?? patch.title ?? 'pending-other'}-${index}`} className="text-sm">
                           <td className="px-4 py-3">
@@ -1260,11 +1318,11 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                                       rel="noopener noreferrer"
                                       className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 hover:underline dark:text-blue-400 dark:hover:text-blue-300"
                                     >
-                                      {normalizePatchName(patch)}
+                                      {patchName}
                                       <ExternalLink className="h-3 w-3" />
                                     </a>
                                   ) : (
-                                    normalizePatchName(patch)
+                                    patchName
                                   )}
                                 </div>
                                 {notDownloaded && (
@@ -1324,21 +1382,28 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                               </span>
                             )}
                           </td>
+                          <td className="px-4 py-3">
+                            <span className={`inline-flex items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium ${approvalBadge.className}`}>
+                              {approvalBadge.label}
+                            </span>
+                          </td>
                           <td className="px-2 py-3">
                             {patchId && (
-                              <button
-                                type="button"
-                                title={`Install ${normalizePatchName(patch)}`}
-                                disabled={isBusy || isInstalling}
-                                onClick={() => queueSinglePatchInstall(patchId, normalizePatchName(patch))}
-                                className="inline-flex items-center justify-center rounded-md border p-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                {isInstalling ? (
-                                  <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
-                                ) : (
-                                  <Download className="h-3.5 w-3.5 text-green-600" />
-                                )}
-                              </button>
+                              <span title={installTitle} className="inline-flex">
+                                <button
+                                  type="button"
+                                  aria-label={installTitle}
+                                  disabled={isBusy || isInstalling || !isApproved}
+                                  onClick={() => queueSinglePatchInstall(patchId, patchName)}
+                                  className="inline-flex items-center justify-center rounded-md border p-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {isInstalling ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
+                                  ) : (
+                                    <Download className={`h-3.5 w-3.5 ${isApproved ? 'text-green-600' : 'text-muted-foreground'}`} />
+                                  )}
+                                </button>
+                              </span>
                             )}
                           </td>
                         </tr>
