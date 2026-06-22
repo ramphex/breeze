@@ -30,6 +30,7 @@ vi.mock('../../db/schema', () => ({
     id: 'patches.id',
     source: 'patches.source',
     externalId: 'patches.externalId',
+    packageId: 'patches.packageId',
     title: 'patches.title',
     description: 'patches.description',
     severity: 'patches.severity',
@@ -213,11 +214,68 @@ describe('device patch routes', () => {
     expect(body.data.compliancePercent).toBe(50);
   });
 
+  it('excludes Linux installed package inventory from patch compliance', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({ id: DEVICE_ID, orgId: '11111111-1111-1111-1111-111111111111' } as any);
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectPatchStatusResult([
+        {
+          id: 'dp-linux-pending',
+          patchId: '11111111-1111-4111-8111-111111111111',
+          status: 'pending',
+          installedAt: null,
+          lastCheckedAt: '2026-02-09T10:00:00.000Z',
+          failureCount: 0,
+          lastError: null,
+          externalId: 'apt:openssl@3.0.2-0ubuntu1.20',
+          packageId: 'apt:openssl',
+          title: 'openssl',
+          description: null,
+          severity: 'unknown',
+          category: 'system',
+          source: 'linux',
+          releaseDate: null,
+          requiresReboot: false
+        },
+        {
+          id: 'dp-linux-installed',
+          patchId: '22222222-2222-4222-8222-222222222222',
+          status: 'installed',
+          installedAt: null,
+          lastCheckedAt: '2026-02-09T10:00:00.000Z',
+          failureCount: 0,
+          lastError: null,
+          externalId: 'apt:zlib1g',
+          packageId: 'apt:zlib1g',
+          title: 'zlib1g',
+          description: null,
+          severity: 'unknown',
+          category: 'system',
+          source: 'linux',
+          releaseDate: null,
+          requiresReboot: false
+        }
+      ]) as any)
+      .mockReturnValueOnce(selectWhereResult([]) as any);
+
+    const res = await app.request(`/devices/${DEVICE_ID}/patches`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.data.pending).toHaveLength(1);
+    expect(body.data.pending[0].externalId).toBe('apt:openssl@3.0.2-0ubuntu1.20');
+    expect(body.data.installed).toHaveLength(0);
+    expect(body.data.compliancePercent).toBe(0);
+  });
+
   it('queues install_patches command with patch metadata', async () => {
     vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({ id: DEVICE_ID, orgId: '11111111-1111-1111-1111-111111111111' } as any);
     vi.mocked(db.select)
       .mockReturnValueOnce(selectWhereResult([
-        { id: PATCH_ID, source: 'linux', externalId: 'apt:openssl', title: 'OpenSSL' }
+        { id: PATCH_ID, source: 'linux', externalId: 'apt:openssl@3.0.2-0ubuntu1.20', packageId: 'apt:openssl', title: 'OpenSSL' }
       ]) as any)
       .mockReturnValueOnce(selectWhereResult([
         { patchId: PATCH_ID }
@@ -248,7 +306,13 @@ describe('device patch routes', () => {
       'install_patches',
       {
         patchIds: [PATCH_ID],
-        patches: [{ id: PATCH_ID, source: 'linux', externalId: 'apt:openssl', title: 'OpenSSL' }]
+        patches: [{
+          id: PATCH_ID,
+          source: 'linux',
+          externalId: 'apt:openssl@3.0.2-0ubuntu1.20',
+          packageId: 'apt:openssl',
+          title: 'OpenSSL'
+        }]
       },
       { userId: USER_ID, preferHeartbeat: false }
     );

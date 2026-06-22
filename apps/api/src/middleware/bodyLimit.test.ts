@@ -40,6 +40,24 @@ describe('bodyLimitForPath', () => {
     });
   });
 
+  it('carves out agent patch inventory submits at 5MB', () => {
+    for (const path of [
+      '/api/v1/agents/agent-1/patches',
+      '/api/v1/agents/agent-1/patches/pending',
+      '/api/v1/agents/agent-1/patches/installed',
+    ]) {
+      expect(bodyLimitForPath(path)).toEqual({
+        maxSize: 5 * MB,
+        error: 'Patch inventory too large (max 5MB)',
+      });
+    }
+  });
+
+  it('does not over-match the patch inventory carve-out to unrelated agent routes', () => {
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/heartbeat').maxSize).toBe(1 * MB);
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/patches/history').maxSize).toBe(1 * MB);
+  });
+
   // Regression for #1377: the software package (installer) upload route must get a
   // 500MB+ carve-out, not the 1MB default. Before the fix, any installer over 1MB
   // was rejected by the global gate with "Request body too large" before the route's

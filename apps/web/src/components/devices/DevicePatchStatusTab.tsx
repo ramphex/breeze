@@ -27,6 +27,7 @@ type PatchItem = {
   kb?: string;
   kbNumber?: string;
   externalId?: string;
+  packageId?: string;
   description?: string;
   severity?: string;
   status?: string;
@@ -65,6 +66,31 @@ type PatchInstallResponse = {
   commandId?: string;
   commandStatus?: string;
   patchCount?: number;
+};
+
+type PatchHistoryResultItem = {
+  id?: string;
+  installId?: string;
+  name?: string;
+  title?: string;
+  source?: string;
+  externalId?: string;
+  packageId?: string;
+  status?: string;
+  rebootRequired?: boolean;
+};
+
+type PatchHistoryEntry = {
+  type?: string;
+  status?: string;
+  completedAt?: string;
+  result?: {
+    results?: PatchHistoryResultItem[];
+  };
+};
+
+type PatchHistoryResponse = {
+  history?: PatchHistoryEntry[];
 };
 
 type DevicePatchStatusTabProps = {
@@ -143,8 +169,8 @@ function getPatchDisplayCopy(osType: OSType): PatchDisplayCopy {
         pendingThirdPartyEmpty: 'No pending third-party updates.',
         pendingThirdPartyPrimaryColumn: 'Software',
         pendingThirdPartySecondaryColumn: 'Category',
-        installedNativeTitle: 'Installed Linux Updates',
-        installedNativeEmpty: 'No Linux updates reported.',
+        installedNativeTitle: 'Recently Installed Linux Updates',
+        installedNativeEmpty: 'No recent Linux update installs.',
         installedNativePrimaryColumn: 'Package',
         installedThirdPartyTitle: 'Installed Third-Party Updates'
       };
@@ -316,6 +342,54 @@ function normalizePatchName(patch: PatchItem) {
   return patch.title || patch.name || patch.kb || patch.kbNumber || 'Unnamed patch';
 }
 
+function isInstalledResultStatus(status?: string) {
+  const normalized = (status || '').toLowerCase();
+  return normalized === 'installed' || normalized === 'success' || normalized === 'completed';
+}
+
+function isLinuxInstallResult(patch: PatchHistoryResultItem) {
+  const source = (patch.source || '').toLowerCase();
+  const installId = (patch.installId || '').toLowerCase();
+  const externalId = (patch.externalId || '').toLowerCase();
+  const packageId = (patch.packageId || '').toLowerCase();
+
+  return source === 'linux' ||
+    installId.startsWith('apt:') ||
+    installId.startsWith('yum:') ||
+    externalId.startsWith('apt:') ||
+    externalId.startsWith('yum:') ||
+    packageId.startsWith('apt:') ||
+    packageId.startsWith('yum:');
+}
+
+function recentLinuxInstallsFromHistory(history: PatchHistoryEntry[]): PatchItem[] {
+  for (const entry of history) {
+    if ((entry.status || '').toLowerCase() !== 'completed') {
+      continue;
+    }
+    const results = entry.result?.results ?? [];
+    const installed = results
+      .filter((patch) => isInstalledResultStatus(patch.status) && isLinuxInstallResult(patch))
+      .map((patch): PatchItem => ({
+        id: patch.id ?? patch.installId ?? patch.externalId ?? patch.packageId,
+        title: patch.title ?? patch.name ?? patch.packageId ?? patch.installId ?? patch.externalId,
+        name: patch.name ?? patch.title ?? patch.packageId ?? patch.installId ?? patch.externalId,
+        source: 'linux',
+        status: 'installed',
+        externalId: patch.externalId,
+        packageId: patch.packageId,
+        category: 'system',
+        installedAt: entry.completedAt,
+        requiresReboot: patch.rebootRequired,
+      }));
+    if (installed.length > 0) {
+      return installed;
+    }
+  }
+
+  return [];
+}
+
 function getSeverityBadge(severity?: string) {
   const normalized = (severity || '').trim().toLowerCase();
   if (!normalized) return null;
@@ -475,6 +549,7 @@ const INSTALL_POLL_MAX_DURATION_MS = 1_800_000;
 
 export default function DevicePatchStatusTab({ deviceId, timezone, osType }: DevicePatchStatusTabProps) {
   const [payload, setPayload] = useState<PatchPayload | null>(null);
+  const [recentLinuxInstalls, setRecentLinuxInstalls] = useState<PatchItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [siteTimezone, setSiteTimezone] = useState<string | undefined>(timezone);
@@ -501,6 +576,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
 
   // Use provided timezone, fetched siteTimezone, or browser default
   const effectiveTimezone = timezone ?? siteTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const normalizedOsType: OSType = osType ?? 'macos';
 
   const fetchPatchStatus = useCallback(async (silent = false) => {
     if (!silent) {
@@ -533,6 +609,46 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     fetchPatchStatus();
   }, [fetchPatchStatus]);
 
+  useEffect(() => {
+    if (normalizedOsType !== 'linux') {
+      setRecentLinuxInstalls([]);
+      return;
+    }
+
+    let cancelled = false;
+    const fetchRecentLinuxInstalls = async () => {
+      setRecentLinuxInstalls([]);
+      try {
+        const params = new URLSearchParams({
+          limit: '5',
+          offset: '0',
+          type: 'install',
+          status: 'completed',
+        });
+        const response = await fetchWithAuth(`/devices/${deviceId}/patches/history?${params.toString()}`);
+        if (!response.ok) {
+          if (!cancelled) {
+            setRecentLinuxInstalls([]);
+          }
+          return;
+        }
+        const json = await response.json() as PatchHistoryResponse;
+        if (!cancelled) {
+          setRecentLinuxInstalls(recentLinuxInstallsFromHistory(json.history ?? []));
+        }
+      } catch {
+        if (!cancelled) {
+          setRecentLinuxInstalls([]);
+        }
+      }
+    };
+
+    void fetchRecentLinuxInstalls();
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId, normalizedOsType]);
+
   // Clean up polling on unmount
   useEffect(() => {
     return () => {
@@ -543,7 +659,6 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     };
   }, []);
 
-  const normalizedOsType: OSType = osType ?? 'macos';
   const displayCopy = useMemo(() => getPatchDisplayCopy(normalizedOsType), [normalizedOsType]);
   const NativeIcon = displayCopy.nativeIcon;
   const nativeSource = useMemo(() => getNativePatchSource(normalizedOsType), [normalizedOsType]);
@@ -569,11 +684,19 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     const nativePending = inferredPending.filter(patch => isNativePatchForOs(patch, normalizedOsType));
     const otherPending = inferredPending.filter(patch => !isNativePatchForOs(patch, normalizedOsType));
 
-    const nativeInstalled = inferredInstalled.filter(patch => isNativePatchForOs(patch, normalizedOsType));
-    const thirdPartyInstalled = inferredInstalled.filter(patch => !isNativePatchForOs(patch, normalizedOsType));
+    const effectiveInstalled = normalizedOsType === 'linux'
+      ? inferredInstalled.filter(patch => !isLinuxPatch(patch))
+      : inferredInstalled;
+    const nativeInstalled = normalizedOsType === 'linux'
+      ? []
+      : effectiveInstalled.filter(patch => isNativePatchForOs(patch, normalizedOsType));
+    const thirdPartyInstalled = effectiveInstalled.filter(patch => !isNativePatchForOs(patch, normalizedOsType));
 
-    const total = inferredPending.length + inferredInstalled.length;
-    const compliance = data.compliancePercent ?? data.compliance ?? (total > 0 ? Math.round((inferredInstalled.length / total) * 100) : 100);
+    const total = inferredPending.length + effectiveInstalled.length;
+    const computedCompliance = total > 0 ? Math.round((effectiveInstalled.length / total) * 100) : 100;
+    const compliance = normalizedOsType === 'linux'
+      ? computedCompliance
+      : data.compliancePercent ?? data.compliance ?? computedCompliance;
 
     return {
       pendingNative: nativePending,
@@ -591,6 +714,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   const thirdPartyPendingIds = useMemo(() => readApprovedPatchIds(pendingOther), [pendingOther]);
   const nativeAwaitingApproval = useMemo(() => pendingNative.filter(isAwaitingApproval).length, [pendingNative]);
   const thirdPartyAwaitingApproval = useMemo(() => pendingOther.filter(isAwaitingApproval).length, [pendingOther]);
+  const displayedInstalledNative = normalizedOsType === 'linux' ? recentLinuxInstalls : installedNative;
 
   // -------------------------------------------------------------------------
   // Post-install polling: poll every 5s for up to 90s watching pending count
@@ -939,7 +1063,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
           </div>
           <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
             <span>{pendingNative.length + pendingOther.length} pending</span>
-            <span>{installedNative.length + installedThirdParty.length} installed</span>
+            <span>{displayedInstalledNative.length + installedThirdParty.length} installed</span>
           </div>
         </div>
       </div>
@@ -1235,7 +1359,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
             <CheckCircle className="h-4 w-4 text-green-500" />
             <NativeIcon className="h-4 w-4 text-gray-600" />
             <h3 className="text-sm font-semibold">{displayCopy.installedNativeTitle}</h3>
-            <span className="text-xs text-muted-foreground">({installedNative.length})</span>
+            <span className="text-xs text-muted-foreground">({displayedInstalledNative.length})</span>
           </div>
           <div className="mt-4 overflow-hidden rounded-md border">
             <div className="max-h-64 overflow-y-auto">
@@ -1249,14 +1373,14 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {installedNative.length === 0 ? (
+                  {displayedInstalledNative.length === 0 ? (
                     <tr>
                       <td colSpan={normalizedOsType === 'windows' ? 4 : 3} className="px-4 py-6 text-center text-sm text-muted-foreground">
                         {displayCopy.installedNativeEmpty}
                       </td>
                     </tr>
                   ) : (
-                    installedNative.map((patch, index) => {
+                    displayedInstalledNative.map((patch, index) => {
                       const badge = getCategoryBadge(patch, normalizedOsType);
                       const kbLabel = getKbLabel(patch);
                       return (

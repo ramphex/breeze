@@ -1720,6 +1720,7 @@ func (h *Heartbeat) sendPatchInventory() {
 	if err != nil {
 		log.Warn("patch inventory collection warning", "error", err.Error())
 	}
+	installedItems = installedPatchStateItems(installedItems)
 
 	if len(pendingItems) == 0 && len(installedItems) == 0 {
 		log.Debug("no patches found")
@@ -1736,6 +1737,7 @@ func (h *Heartbeat) sendPatchInventory() {
 }
 
 func (h *Heartbeat) sendPatchInventoryData(pendingItems, installedItems []map[string]any, source string, full bool) (error, error) {
+	installedItems = installedPatchStateItems(installedItems)
 	pendingPayload := map[string]any{
 		"patches": pendingItems,
 	}
@@ -1762,6 +1764,17 @@ func (h *Heartbeat) sendPatchInventoryData(pendingItems, installedItems []map[st
 		fmt.Sprintf("installed patches (%d)", len(installedItems)),
 	)
 	return nil, installedErr
+}
+
+func installedPatchStateItems(items []map[string]any) []map[string]any {
+	filtered := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if source, ok := item["source"].(string); ok && source == "linux" {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func (h *Heartbeat) collectPatchInventory() ([]map[string]any, []map[string]any, error) {
@@ -1795,6 +1808,7 @@ func (h *Heartbeat) availablePatchesToMaps(patches []patching.AvailablePatch) []
 		if severity == "" {
 			severity = "unknown"
 		}
+		source := h.mapPatchProviderSource(p.Provider)
 		category := p.Category
 		if category == "" {
 			category = h.mapPatchProviderCategory(p.Provider)
@@ -1811,6 +1825,9 @@ func (h *Heartbeat) availablePatchesToMaps(patches []patching.AvailablePatch) []
 		externalId := p.KBNumber
 		if externalId == "" {
 			externalId = p.ID
+			if source == "linux" && p.Version != "" {
+				externalId = p.ID + "@" + p.Version
+			}
 		}
 		items[i] = map[string]any{
 			"name":            p.Title,
@@ -1818,7 +1835,7 @@ func (h *Heartbeat) availablePatchesToMaps(patches []patching.AvailablePatch) []
 			"category":        category,
 			"severity":        severity,
 			"description":     p.Description,
-			"source":          h.mapPatchProviderSource(p.Provider),
+			"source":          source,
 			"externalId":      externalId,
 			"packageId":       p.ID,
 			"vendor":          extractVendor(p.Provider, p.ID),
@@ -3076,6 +3093,7 @@ type patchCommandRef struct {
 	ID         string
 	Source     string
 	ExternalID string
+	PackageID  string
 	Title      string
 }
 
@@ -3099,55 +3117,46 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 		installID, resolveErr := h.resolvePatchInstallID(ref)
 		if resolveErr != nil {
 			failedCount++
-			results = append(results, map[string]any{
-				"id":     ref.ID,
-				"status": "failed",
-				"error":  resolveErr.Error(),
-			})
+			result := patchCommandResultFields(ref, "")
+			result["status"] = "failed"
+			result["error"] = resolveErr.Error()
+			results = append(results, result)
 			continue
 		}
 
 		if rollback {
 			if err := h.patchMgr.Uninstall(installID); err != nil {
 				failedCount++
-				results = append(results, map[string]any{
-					"id":        ref.ID,
-					"installId": installID,
-					"status":    "failed",
-					"error":     err.Error(),
-				})
+				result := patchCommandResultFields(ref, installID)
+				result["status"] = "failed"
+				result["error"] = err.Error()
+				results = append(results, result)
 				continue
 			}
 			successCount++
-			results = append(results, map[string]any{
-				"id":        ref.ID,
-				"installId": installID,
-				"status":    "rolled_back",
-			})
+			result := patchCommandResultFields(ref, installID)
+			result["status"] = "rolled_back"
+			results = append(results, result)
 			continue
 		}
 
 		installResult, err := h.patchMgr.Install(installID)
 		if err != nil {
 			failedCount++
-			results = append(results, map[string]any{
-				"id":        ref.ID,
-				"installId": installID,
-				"status":    "failed",
-				"error":     err.Error(),
-			})
+			result := patchCommandResultFields(ref, installID)
+			result["status"] = "failed"
+			result["error"] = err.Error()
+			results = append(results, result)
 			continue
 		}
 
 		successCount++
 		rebootRequired = rebootRequired || installResult.RebootRequired
-		results = append(results, map[string]any{
-			"id":             ref.ID,
-			"installId":      installID,
-			"status":         "installed",
-			"rebootRequired": installResult.RebootRequired,
-			"message":        installResult.Message,
-		})
+		result := patchCommandResultFields(ref, installID)
+		result["status"] = "installed"
+		result["rebootRequired"] = installResult.RebootRequired
+		result["message"] = installResult.Message
+		results = append(results, result)
 	}
 
 	summary := map[string]any{
@@ -3196,6 +3205,20 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 	return tools.NewSuccessResult(summary, durationMs)
 }
 
+func patchCommandResultFields(ref patchCommandRef, installID string) map[string]any {
+	result := map[string]any{
+		"id":         ref.ID,
+		"source":     ref.Source,
+		"externalId": ref.ExternalID,
+		"packageId":  ref.PackageID,
+		"title":      ref.Title,
+	}
+	if installID != "" {
+		result["installId"] = installID
+	}
+	return result
+}
+
 func (h *Heartbeat) patchRefsFromPayload(payload map[string]any) []patchCommandRef {
 	refs := make([]patchCommandRef, 0)
 	seen := map[string]struct{}{}
@@ -3210,6 +3233,7 @@ func (h *Heartbeat) patchRefsFromPayload(payload map[string]any) []patchCommandR
 				ID:         tools.GetPayloadString(obj, "id", tools.GetPayloadString(obj, "patchId", "")),
 				Source:     tools.GetPayloadString(obj, "source", ""),
 				ExternalID: tools.GetPayloadString(obj, "externalId", ""),
+				PackageID:  tools.GetPayloadString(obj, "packageId", ""),
 				Title:      tools.GetPayloadString(obj, "title", ""),
 			}
 			key := fmt.Sprintf("%s|%s|%s", ref.ID, ref.Source, ref.ExternalID)
@@ -3266,6 +3290,9 @@ func (h *Heartbeat) resolvePatchInstallID(ref patchCommandRef) (string, error) {
 			}
 		default:
 			if h.patchMgr.HasProvider(provider) {
+				if (provider == "apt" || provider == "yum") && strings.Contains(local, "@") {
+					return provider + ":" + strings.SplitN(local, "@", 2)[0], nil
+				}
 				return provider + ":" + local, nil
 			}
 		}
@@ -3341,7 +3368,17 @@ func splitPatchID(value string) (string, string, bool) {
 }
 
 func patchLocalID(ref patchCommandRef) string {
+	if _, local, ok := splitPatchID(ref.PackageID); ok {
+		return local
+	}
+	if ref.PackageID != "" {
+		return ref.PackageID
+	}
 	if _, local, ok := splitPatchID(ref.ExternalID); ok {
+		prefix, _, _ := splitPatchID(ref.ExternalID)
+		if (prefix == "apt" || prefix == "yum") && strings.Contains(local, "@") {
+			return strings.SplitN(local, "@", 2)[0]
+		}
 		parts := strings.SplitN(ref.ExternalID, ":", 3)
 		if len(parts) == 3 && isSourcePrefix(parts[0]) && parts[1] != "" {
 			return parts[1]
@@ -3349,6 +3386,10 @@ func patchLocalID(ref patchCommandRef) string {
 		return local
 	}
 	if _, local, ok := splitPatchID(ref.ID); ok {
+		prefix, _, _ := splitPatchID(ref.ID)
+		if (prefix == "apt" || prefix == "yum") && strings.Contains(local, "@") {
+			return strings.SplitN(local, "@", 2)[0]
+		}
 		return local
 	}
 	if ref.ExternalID != "" {

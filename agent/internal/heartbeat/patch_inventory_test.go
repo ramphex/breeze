@@ -36,13 +36,13 @@ func TestSendPatchInventoryDataSendsPendingThenInstalled(t *testing.T) {
 
 	installed := make([]map[string]any, 251)
 	for i := range installed {
-		installed[i] = map[string]any{"name": "pkg", "source": "linux"}
+		installed[i] = map[string]any{"name": "KB5000001", "source": "microsoft"}
 	}
 
 	pendingErr, installedErr := h.sendPatchInventoryData(
-		[]map[string]any{{"name": "openssl", "source": "linux"}},
+		[]map[string]any{{"name": "KB5000001", "source": "microsoft"}},
 		installed,
-		"linux",
+		"microsoft",
 		false,
 	)
 	if pendingErr != nil {
@@ -62,7 +62,7 @@ func TestSendPatchInventoryDataSendsPendingThenInstalled(t *testing.T) {
 	if err := json.Unmarshal(requests[0].body, &pendingPayload); err != nil {
 		t.Fatalf("pending JSON error = %v", err)
 	}
-	if pendingPayload["source"] != "linux" {
+	if pendingPayload["source"] != "microsoft" {
 		t.Fatalf("pending source = %#v", pendingPayload["source"])
 	}
 	if _, ok := pendingPayload["full"]; ok {
@@ -81,6 +81,41 @@ func TestSendPatchInventoryDataSendsPendingThenInstalled(t *testing.T) {
 	}
 	if len(installedPayload.Installed) != len(installed) {
 		t.Fatalf("installed payload size = %d", len(installedPayload.Installed))
+	}
+}
+
+func TestSendPatchInventoryDataSkipsLinuxInstalledPackageInventory(t *testing.T) {
+	var requests []patchInventoryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v", err)
+		}
+		requests = append(requests, patchInventoryRequest{path: r.URL.Path, body: body})
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+	h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
+
+	pendingErr, installedErr := h.sendPatchInventoryData(
+		[]map[string]any{{"name": "openssl", "source": "linux"}},
+		[]map[string]any{{"name": "openssl", "source": "linux"}},
+		"linux",
+		false,
+	)
+	if pendingErr != nil {
+		t.Fatalf("pendingErr = %v", pendingErr)
+	}
+	if installedErr != nil {
+		t.Fatalf("installedErr = %v", installedErr)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("expected only pending request, got %d: %#v", len(requests), requests)
+	}
+	if requests[0].path != "/api/v1/agents/agent-1/patches/pending" {
+		t.Fatalf("path = %q", requests[0].path)
 	}
 }
 

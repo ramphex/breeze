@@ -23,6 +23,11 @@ export function bodyLimitForPath(path: string): { maxSize: number; error: string
   if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/)) {
     return { maxSize: 50 * 1024 * 1024, error: 'File too large (max ~37MB)' };
   }
+  // Patch inventory submissions can carry thousands of pending update rows.
+  // Keep this aligned with the patch ingest schemas' 5000-item caps.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/patches(?:\/pending|\/installed)?$/)) {
+    return { maxSize: 5 * 1024 * 1024, error: 'Patch inventory too large (max 5MB)' };
+  }
   // Software package (installer) uploads are multipart and capped at 500MB by the
   // route's own MAX_UPLOAD_SIZE check; give the body limit headroom over that so the
   // route returns its specific "File too large" message instead of this generic one.

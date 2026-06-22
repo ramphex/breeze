@@ -181,8 +181,16 @@ async function upsertInstalledPatches(
   executor: PatchIngestExecutor,
   device: PatchIngestDevice,
   patchList: InstalledPatchData[],
-): Promise<void> {
+): Promise<number> {
+  let processed = 0;
   for (const patchData of patchList) {
+    // Linux package-manager inventories are owned by software_inventory. They
+    // are not installed patch/update records and must not be allowed to flip
+    // actionable Linux update rows from pending to installed.
+    if (patchData.source === 'linux') {
+      continue;
+    }
+
     const externalId = patchData.externalId ||
       patchData.kbNumber ||
       `${patchData.source}:${patchData.name}:${patchData.version || 'latest'}`;
@@ -249,7 +257,9 @@ async function upsertInstalledPatches(
           updatedAt: new Date()
         }
       });
+    processed++;
   }
+  return processed;
 }
 
 /**
@@ -341,8 +351,9 @@ patchesRoutes.put('/:id/patches/installed', zValidator('json', submitInstalledPa
     return c.json({ error: 'Device not found' }, 404);
   }
 
+  let installedCount = 0;
   await db.transaction(async (tx) => {
-    await upsertInstalledPatches(tx, device, data.installed);
+    installedCount = await upsertInstalledPatches(tx, device, data.installed);
   });
 
   writeAuditEvent(c, {
@@ -353,29 +364,31 @@ patchesRoutes.put('/:id/patches/installed', zValidator('json', submitInstalledPa
     resourceType: 'device',
     resourceId: device.id,
     details: {
-      installedCount: data.installed.length,
+      installedCount,
+      ignoredLinuxPackageCount: data.installed.length - installedCount,
     },
   });
 
-  return c.json({ success: true, installed: data.installed.length });
+  return c.json({ success: true, installed: installedCount, ignored: data.installed.length - installedCount });
 });
 
 patchesRoutes.put('/:id/patches', zValidator('json', submitPatchesSchema), async (c) => {
   const agentId = c.req.param('id');
   const data = c.req.valid('json');
   const agent = c.get('agent') as { orgId?: string; agentId?: string } | undefined;
-  const installedCount = data.installed?.length || 0;
-  console.log(`[PATCHES] Agent ${agentId} submitting ${data.patches.length} pending, ${installedCount} installed`);
+  const submittedInstalledCount = data.installed?.length || 0;
+  console.log(`[PATCHES] Agent ${agentId} submitting ${data.patches.length} pending, ${submittedInstalledCount} installed`);
 
   const device = await getDeviceForPatchIngest(agentId);
   if (!device) {
     return c.json({ error: 'Device not found' }, 404);
   }
 
+  let installedCount = 0;
   await db.transaction(async (tx) => {
     await markAllDevicePatchesMissing(tx, device.id);
     await upsertPendingPatches(tx, device, data.patches);
-    await upsertInstalledPatches(tx, device, data.installed ?? []);
+    installedCount = await upsertInstalledPatches(tx, device, data.installed ?? []);
   });
 
   // Prune stale tombstones after the scan commits. Outside the txn on purpose:
@@ -393,8 +406,14 @@ patchesRoutes.put('/:id/patches', zValidator('json', submitPatchesSchema), async
     details: {
       pendingCount: data.patches.length,
       installedCount,
+      ignoredLinuxPackageCount: submittedInstalledCount - installedCount,
     },
   });
 
-  return c.json({ success: true, pending: data.patches.length, installed: installedCount });
+  return c.json({
+    success: true,
+    pending: data.patches.length,
+    installed: installedCount,
+    ignored: submittedInstalledCount - installedCount
+  });
 });

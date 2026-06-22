@@ -37,6 +37,7 @@ func handlePatchScan(h *Heartbeat, cmd Command) tools.CommandResult {
 		pendingItems = filterPatchInventoryItemsBySource(pendingItems, source)
 		installedItems = filterPatchInventoryItemsBySource(installedItems, source)
 	}
+	installedItems = installedPatchStateItems(installedItems)
 
 	pendingErr, installedErr := h.sendPatchInventoryData(pendingItems, installedItems, source, source == "")
 	if pendingErr != nil {

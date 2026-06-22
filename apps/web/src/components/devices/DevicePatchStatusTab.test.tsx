@@ -238,6 +238,75 @@ describe('DevicePatchStatusTab', () => {
     expect((installThirdPartyButton as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it('shows Linux pending updates and recent install history without showing installed package inventory', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => {
+      if (url.includes('/patches/history?') && url.includes('type=install')) {
+        return makeJsonResponse({
+          history: [
+            {
+              type: 'install_patches',
+              status: 'completed',
+              completedAt: '2026-06-21T22:47:00.000Z',
+              result: {
+                results: [
+                  {
+                    id: 'installed-1',
+                    title: 'bash',
+                    source: 'linux',
+                    externalId: 'apt:bash@5.1-6ubuntu1.1',
+                    packageId: 'apt:bash',
+                    installId: 'apt:bash',
+                    status: 'installed',
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (url.includes('/patches/history')) {
+        return makeJsonResponse({ history: [], total: 0 });
+      }
+      return makeJsonResponse({
+        data: {
+          compliancePercent: 100,
+          pending: [
+            {
+              id: 'pending-1',
+              title: 'openssl',
+              source: 'linux',
+              externalId: 'apt:openssl@3.0.2-0ubuntu1.20',
+              packageId: 'apt:openssl',
+              category: 'system',
+              status: 'pending',
+            },
+          ],
+          installed: [
+            {
+              id: 'pkg-1',
+              title: 'zlib1g',
+              source: 'linux',
+              externalId: 'apt:zlib1g',
+              packageId: 'apt:zlib1g',
+              category: 'system',
+              status: 'installed',
+            },
+          ],
+        },
+      });
+    });
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="linux" />);
+
+    await screen.findByText('Pending Linux Updates');
+    await screen.findByText('openssl');
+    await screen.findByText('Recently Installed Linux Updates');
+    await screen.findByText('bash');
+    expect(screen.queryByText('Installed Linux Updates')).toBeNull();
+    expect(screen.queryByText('zlib1g')).toBeNull();
+    expect(screen.queryByText('0% compliant')).not.toBeNull();
+  });
+
   it('excludes missing records from pending install counts', async () => {
     fetchWithAuthMock.mockResolvedValue(
       makeJsonResponse({

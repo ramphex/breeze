@@ -246,6 +246,7 @@ patchesRoutes.get(
         severity: patches.severity,
         category: patches.category,
         source: patches.source,
+        packageId: patches.packageId,
         releaseDate: patches.releaseDate,
         requiresReboot: patches.requiresReboot
       })
@@ -270,6 +271,7 @@ patchesRoutes.get(
         name: p.title,
         title: p.title,
         externalId: p.externalId,
+        packageId: p.packageId,
         description: p.description,
         severity: p.severity,
         status: p.status,
@@ -287,6 +289,7 @@ patchesRoutes.get(
         name: p.title,
         title: p.title,
         externalId: p.externalId,
+        packageId: p.packageId,
         description: p.description,
         severity: p.severity,
         status: p.status,
@@ -298,12 +301,13 @@ patchesRoutes.get(
       }));
 
     const installed = devicePatchList
-      .filter(p => p.status === 'installed')
+      .filter(p => p.status === 'installed' && p.source !== 'linux')
       .map(p => ({
         id: p.patchId,
         name: p.title,
         title: p.title,
         externalId: p.externalId,
+        packageId: p.packageId,
         description: p.description,
         severity: p.severity,
         status: p.status,
@@ -344,11 +348,13 @@ patchesRoutes.get(
           name: p.title,
           title: p.title,
           externalId: p.externalId,
+          packageId: p.packageId,
           description: p.description,
           severity: p.severity,
           status: p.status,
           releaseDate: p.releaseDate,
           installedAt: p.installedAt,
+          source: p.source,
           approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending'
         }))
       }
@@ -381,6 +387,7 @@ patchesRoutes.post(
         id: patches.id,
         source: patches.source,
         externalId: patches.externalId,
+        packageId: patches.packageId,
         title: patches.title
       })
       .from(patches)

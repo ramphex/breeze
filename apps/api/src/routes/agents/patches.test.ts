@@ -535,7 +535,34 @@ describe('split patch ingest endpoints', () => {
     expect(tx.insert).not.toHaveBeenCalled();
   });
 
-  it('upserts installed patch batches without tombstoning pending rows', async () => {
+  it('upserts non-Linux installed patch batches without tombstoning pending rows', async () => {
+    const { tx } = mockPatchInsertTx();
+    vi.mocked(db.transaction).mockImplementation(async (fn) => fn(tx as unknown as Parameters<typeof fn>[0]));
+
+    const res = await mountAgentPatchRoutes().request(`/agents/${AGENT_ID}/patches/installed`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        installed: [
+          {
+            name: 'Security Intelligence Update',
+            source: 'microsoft',
+            packageId: 'KB5000001',
+            version: '1.2.3',
+          },
+        ],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ success: true, installed: 1, ignored: 0 });
+    expect(tx.update).not.toHaveBeenCalled();
+    expect(tx.insert).toHaveBeenCalledWith(tables.patches);
+    expect(tx.insert).toHaveBeenCalledWith(tables.devicePatches);
+  });
+
+  it('ignores Linux installed package inventory without touching patch state', async () => {
     const { tx } = mockPatchInsertTx();
     vi.mocked(db.transaction).mockImplementation(async (fn) => fn(tx as unknown as Parameters<typeof fn>[0]));
 
@@ -547,7 +574,7 @@ describe('split patch ingest endpoints', () => {
           {
             name: 'openssl',
             source: 'linux',
-            packageId: 'openssl',
+            packageId: 'apt:openssl',
             version: '3.0.2-0ubuntu1.20',
           },
         ],
@@ -556,10 +583,9 @@ describe('split patch ingest endpoints', () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ success: true, installed: 1 });
+    expect(body).toEqual({ success: true, installed: 0, ignored: 1 });
     expect(tx.update).not.toHaveBeenCalled();
-    expect(tx.insert).toHaveBeenCalledWith(tables.patches);
-    expect(tx.insert).toHaveBeenCalledWith(tables.devicePatches);
+    expect(tx.insert).not.toHaveBeenCalled();
   });
 });
 
