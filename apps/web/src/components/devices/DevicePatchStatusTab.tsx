@@ -742,19 +742,15 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   const nativeSource = useMemo(() => getNativePatchSource(normalizedOsType), [normalizedOsType]);
   const nativeProviderLabel = useMemo(() => getNativePatchProviderLabel(normalizedOsType), [normalizedOsType]);
 
-  const { pendingNative, pendingOther, installedNative, installedThirdParty, compliancePercent, missingCount } = useMemo(() => {
+  const { pendingNative, pendingOther, installedNative, installedThirdParty, compliancePercent } = useMemo(() => {
     const data = payload ?? {};
     const pendingList = data.pending ?? data.pendingPatches ?? data.available ?? [];
-    const missingList = data.missing ?? data.missingPatches ?? [];
     const installedList = data.installed ?? data.installedPatches ?? data.applied ?? [];
     const patches = data.patches ?? [];
 
     const inferredPending = pendingList.length > 0
       ? pendingList
       : patches.filter(patch => (patch.status || '').toLowerCase() === 'pending' || (patch.status || '').toLowerCase() === 'available');
-    const inferredMissing = missingList.length > 0
-      ? missingList
-      : patches.filter(patch => (patch.status || '').toLowerCase() === 'missing');
     const inferredInstalled = installedList.length > 0
       ? installedList
       : patches.filter(patch => (patch.status || '').toLowerCase() === 'installed');
@@ -781,8 +777,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
       pendingOther: otherPending,
       installedNative: nativeInstalled,
       installedThirdParty: thirdPartyInstalled,
-      compliancePercent: compliance,
-      missingCount: inferredMissing.length
+      compliancePercent: compliance
     };
   }, [payload, normalizedOsType]);
 
@@ -1126,11 +1121,6 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
           </div>
         )}
 
-        {missingCount > 0 && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            {missingCount} update{missingCount === 1 ? '' : 's'} from earlier scans {missingCount === 1 ? 'is' : 'are'} no longer reported and {missingCount === 1 ? 'is' : 'are'} not counted as pending.
-          </p>
-        )}
       </div>
 
       {/* ================================================================ */}

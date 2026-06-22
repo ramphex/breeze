@@ -425,7 +425,7 @@ describe('DevicePatchStatusTab', () => {
       node?.textContent?.startsWith('Last scan:') === true &&
       node.textContent.includes('Completed')
     );
-    await screen.findByText(/1 update from earlier scans is no longer reported and is not counted as pending\./i);
+    expect(screen.queryByText(/updates? from earlier scans/i)).not.toBeInTheDocument();
   });
 
   it('sends only approved pending OS patch ids to the install endpoint', async () => {
